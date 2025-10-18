@@ -1,4 +1,4 @@
-## Project 1:
+## Project 1: Classification
 • Hiring and retaining employees are extremely complex tasks that
 require capital, time and skills.<br>
 • “Small business owners spend 40% of their working hours on tasks
@@ -27,7 +27,7 @@ o WorkLifeBalance<br>
 Data Source: [kaggle](https://www.kaggle.com/pavansubhasht/ibm-hr-analytics-attrition-dataset)
 
 -----------------------------------
-## Project 2:
+## Project 2: Clustering
 
 * Marketing is crucial for the growth and sustainability of any business.
 * Marketers can help build the company’s brand, engage customers, grow revenue, and increase sales.
