@@ -1,8 +1,11 @@
 #!/usr/bin/env python
 
 #TODO:
-# 0. Add CV
-# 1. Add grid serach with the config file
+# 0. Add CV, should edit the best model selection: for no cv and cv, do it inside the
+#     train_and_evaluate_models function and return the best model from there.
+#     So, the find_best_model function will be only for ensembling methods.
+# 1. Add grid serach with the config file, for now only return the best model based on the
+#     default hyperparameters.
 # 2. Combine predictors using ensemble methods:
 #     1. Soft voting, 2. Weighted soft voting, 3. Stacking, 4. Blending(?)
 #     Better to define a parameter to select only the best models for ensembling
@@ -13,9 +16,13 @@
 # 5. Plot the results for each model and compare them visually.
 # 6. Add more evaluation metrics like ROC-AUC, Precision-Recall curves, etc.
 # 7. Add correlation matrix to EDA
+# 8. Add feature importance plots for tree-based models.
+# 9. train the final model on the entire training data (train + val) before making predictions on test data.
 
 # Hardcoded parameters:
 # 1. saved score in models score dict is weighted avg f1-score, but it can be changed to any other metric.
+# 2. Columns with ordinal mapping + their order, columns with binary mapping 
+# must be defined for each dataset 
 
 
 import numpy as np
@@ -23,17 +30,18 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import time
+import json
 
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import cross_val_predict, train_test_split
 from sklearn.preprocessing import (
     LabelEncoder, OrdinalEncoder, StandardScaler, OneHotEncoder
 )
 from sklearn.compose import ColumnTransformer
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline
-from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import GridSearchCV, cross_validate
 
 from sklearn.linear_model import (
     LogisticRegression, RidgeClassifier, SGDClassifier,
@@ -68,6 +76,7 @@ def command_line_args():
             Usage:
             ./predicting_Irrigation_Need.py --train-dataset ../data/train.csv
             --test-dataset ../data/test.csv --drop-columns id --eda
+            --models all --cv 5
             """
         )
     parser.add_argument(
@@ -121,6 +130,12 @@ def command_line_args():
         'xgb (XGBoost), lgbm (LightGBM), ada (AdaBoost), svc (SVC),' \
         'lsvc (Linear SVC), knn (KNN), gnb (Gaussian NB), qda, lda,' \
         'mlp (MLP), dummy, or all (which excludes the slow and weak models like gb, svc, lsvc, qda, and dummy)'
+    )
+    parser.add_argument(
+        '--cv',
+        default=False,
+        type=int,
+        help='Doing cross validation with the specified number of folds (e.g., 5 for 5-fold CV)'
     )
     parser.add_argument(
         '--grid-config-file',
@@ -210,7 +225,7 @@ def preprocess_data(train, target_variable, test_size):
     # y: target
 
     X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=test_size, random_state=42
+        X, y, test_size=test_size, random_state=42, stratify=y
     )
     # X_train: col1, col2, ..., y_train: target
     # X_val: col1, col2, ..., y_val: target
@@ -257,7 +272,11 @@ def preprocess_data(train, target_variable, test_size):
 
     return X_train_processed, X_val_processed, y_train_enc, y_val_enc, le, preprocessor
 
-def train_and_evaluate_models(X_train_processed, y_train_enc, X_val_processed, y_val_enc, models):
+def train_and_evaluate_models(
+        X_train_processed, y_train_enc,
+        X_val_processed, y_val_enc,
+        models, cv=False, grid_config_file=None
+    ):
     model_dict = {
         # Linear Models
         'lr': LogisticRegression(random_state=42, max_iter=1000, class_weight='balanced'),
@@ -289,41 +308,120 @@ def train_and_evaluate_models(X_train_processed, y_train_enc, X_val_processed, y
         # Specialized Models
         'dummy': DummyClassifier(strategy='most_frequent'), # Precision ill defined set to 0
     }
-
     if models == ['all']:
         models = list(model_dict.keys())
         # Exclude slow and weak models from 'all'
         exclude_models = ['gb', 'svc', 'lsvc', 'qda', 'dummy']
         models = [model for model in models if model not in exclude_models]
 
-    trained_models = {}
-    model_scores = {}
-    for model_name in models:
-        start = time.time()
+    if grid_config_file:
+        pass
+        # Load grid search configurations from the specified JSON file
+        # with open(grid_config_file, 'r') as f:
+        #     grid_configs = json.load(f)
+        # # Update model_dict with the specified hyperparameters for grid search
+        # for model_name, params in grid_configs.items():
+        #     if model_name in model_dict:
+        #         model_dict[model_name] = GridSearchCV(
+        #             estimator=model_dict[model_name],
+        #             param_grid=params,
+        #             cv=cv if cv else 5,
+        #             n_jobs=-1,
+        #             verbose=1
+        #         )
+        #     else:
+        #         print(f"Warning: Model '{model_name}' not found in model_dict. Skipping grid search for this model.")
+        #### for now, return only the best model here too.
+    elif cv:
+        model_scores = {}
+        
+        for model_name in models:
+            
+            start = time.time()
+            
+            print(f"\n{'='*50}")
+            print(f"Training {model_name.upper()}...")
+            print('='*50)
+            
+            model = model_dict[model_name]
+
+            cv_results = cross_validate(
+                model, X_train_processed, y_train_enc,
+                cv=cv, scoring=['f1_macro', 'f1_weighted'], n_jobs=-1
+            )
+
+            mean_score = cv_results['test_f1_macro'].mean()
+            model_scores[model_name] = mean_score
+
+            end = time.time()
+
+            print(f"Time taken: {end - start:.2f} seconds")
+            print(f"Cross-Validation Results for {model_name.upper()}:")
+            print(f"Mean Macro F1-Score: {mean_score:.4f}")
+
+        # first find the best model based on cv scores, then fit it on the entire training data (train + val) before making predictions on test data
+        # Fit once on full training data for later use in test prediction
+        best_model_name = max(model_scores, key=model_scores.get)
+        best_model = model_dict[best_model_name]
+
+        # train on the entire training data (train + val) before making predictions on test data.
+        best_model.fit(
+            np.concatenate([X_train_processed, X_val_processed]),
+            np.concatenate([y_train_enc, y_val_enc])
+        )
+
         print(f"\n{'='*50}")
-        print(f"Training {model_name.upper()}...")
+        print(f"Best model: {best_model_name.upper()} with CV Macro F1-Score: {model_scores[best_model_name]:.4f}")
         print('='*50)
 
-        model = model_dict[model_name]
-        model.fit(X_train_processed, y_train_enc)
+    else:
+        model_scores = {}
+        
+        for model_name in models:
+            
+            start = time.time()
+            print(f"\n{'='*50}")
+            print(f"Training {model_name.upper()}...")
+            print('='*50)
 
-        y_pred = model.predict(X_val_processed)
-        end = time.time()
-        print(f"Time taken: {end - start:.2f} seconds")
-        print(f"\nClassification Report for {model_name.upper()}:")
-        report = classification_report(y_val_enc, y_pred, output_dict=True, digits=3)
-        print(classification_report(y_val_enc, y_pred))
+            model = model_dict[model_name]
 
-        print(f"\nConfusion Matrix for {model_name.upper()}:")
-        print(confusion_matrix(y_val_enc, y_pred))
+            model.fit(X_train_processed, y_train_enc)
+            y_pred = model.predict(X_val_processed)
+            report = classification_report(y_val_enc, y_pred, output_dict=True, digits=3)
+            model_scores[model_name] = report['macro avg']['f1-score']
 
-        # Store trained model and its weighted avg f1-score
-        trained_models[model_name] = model
-        model_scores[model_name] = report['macro avg']['f1-score']
+            end = time.time()
+            
+            print(f"Time taken: {end - start:.2f} seconds")
+            print(f"\nClassification Report for {model_name.upper()}:")
+            print(classification_report(y_val_enc, y_pred, digits=3))
+            print(f"\nConfusion Matrix for {model_name.upper()}:")
+            print(confusion_matrix(y_val_enc, y_pred))
 
-    return trained_models, model_scores
+        best_model_name = max(model_scores, key=model_scores.get)
+        best_model = model_dict[best_model_name]
 
-def find_best_model(trained_models, model_scores, combination_method=None):
+        # train on the entire training data (train + val) before making predictions on test data.
+        best_model.fit(
+            np.concatenate([X_train_processed, X_val_processed]),
+            np.concatenate([y_train_enc, y_val_enc])
+        )
+
+        print(f"\n{'='*50}")
+        print(f"Best model: {best_model_name.upper()} with Validation Macro F1-Score: {model_scores[best_model_name]:.4f}")
+        print('='*50)
+
+
+    return best_model 
+    
+def combine_models(trained_models, model_scores, combination_method=None):
+    """
+    Find the best model based on the provided model scores and combination method.
+    This is meant to be only for the grid search case, for the cv and non cv cases,
+    the best model is already selected in the train_and_evaluate_models function
+    and returned from there.
+    """
     # model_scores = {'model_name': weighted_avg_f1_score, ...}
     if combination_method == 'soft_voting':
         # Implement soft voting logic here (e.g., average probabilities)
@@ -341,18 +439,23 @@ def find_best_model(trained_models, model_scores, combination_method=None):
         # Implement blending logic here (e.g., train a meta-model on a holdout set)
         # return blended_model
         pass
-    else:
-        best_model_name = max(model_scores, key=model_scores.get)
-        print(f"\n{'='*50}")
-        print(f"Best model: {best_model_name.upper()} with: {model_scores[best_model_name]:.4f}")
-        print('='*50)
-        best_model = trained_models[best_model_name]
-        return best_model
+    # else:
+    #     best_model_name = max(model_scores, key=model_scores.get)
+    #     print(f"\n{'='*50}")
+    #     print(f"Best model: {best_model_name.upper()} with: {model_scores[best_model_name]:.4f}")
+    #     print('='*50)
+    #     best_model = trained_models[best_model_name]
+    #     return best_model
 
 def predict_test_data(test, preprocessor, model, le):
     # Apply the same preprocessing to test data
     test_processed = preprocessor.transform(test)
     print(f"Processed test shape: {test_processed.shape}")
+
+    ####
+    # first fit the model on the entire training data (train + val) before making predictions on test data.
+    ####
+    # model.fit(X_train_processed, y_train_enc)
 
     # Make predictions
     y_pred = model.predict(test_processed)
@@ -374,6 +477,8 @@ def main():
     drop_columns = args.drop_columns
     models = args.models
     output_name = args.output
+    cv=args.cv
+    grid_config_file=args.grid_config_file
 
     train, test, test_id = load_data(
         train_path, test_path, drop_columns
@@ -392,11 +497,19 @@ def main():
         preprocessor
     ) = preprocess_data(train, target_variable, test_size)
 
-    trained_models, model_scores = train_and_evaluate_models(
-        X_train_processed, y_train_enc, X_val_processed, y_val_enc, models
+    # before:
+    # trained_models, model_scores = train_and_evaluate_models(
+    #     X_train_processed, y_train_enc, X_val_processed, y_val_enc, models, cv, grid_config_file
+    # )
+
+    # now for the cv and non cv cases, the best model is already selected in the train_and_evaluate_models function
+    
+    best_model = train_and_evaluate_models(
+        X_train_processed, y_train_enc, X_val_processed, y_val_enc, models, cv, grid_config_file
     )
 
-    best_model = find_best_model(trained_models,model_scores)
+
+    # best_model = find_best_model(trained_models,model_scores)
 
     test_predictions = predict_test_data(test, preprocessor, best_model, le)
     
