@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 #TODO:
+# 0. Add CV
 # 1. Add grid serach with the config file
 # 2. Combine predictors using ensemble methods:
 #     1. Soft voting, 2. Weighted soft voting, 3. Stacking, 4. Blending(?)
@@ -12,6 +13,9 @@
 # 5. Plot the results for each model and compare them visually.
 # 6. Add more evaluation metrics like ROC-AUC, Precision-Recall curves, etc.
 # 7. Add correlation matrix to EDA
+
+# Hardcoded parameters:
+# 1. saved score in models score dict is weighted avg f1-score, but it can be changed to any other metric.
 
 
 import numpy as np
@@ -116,7 +120,7 @@ def command_line_args():
         'gb (Gradient Boosting), hgb (HistGradient Boosting),' \
         'xgb (XGBoost), lgbm (LightGBM), ada (AdaBoost), svc (SVC),' \
         'lsvc (Linear SVC), knn (KNN), gnb (Gaussian NB), qda, lda,' \
-        'mlp (MLP), dummy, or all'
+        'mlp (MLP), dummy, or all (which excludes the slow and weak models like gb, svc, lsvc, qda, and dummy)'
     )
     parser.add_argument(
         '--grid-config-file',
@@ -253,6 +257,98 @@ def preprocess_data(train, target_variable, test_size):
 
     return X_train_processed, X_val_processed, y_train_enc, y_val_enc, le, preprocessor
 
+def train_and_evaluate_models(X_train_processed, y_train_enc, X_val_processed, y_val_enc, models):
+    model_dict = {
+        # Linear Models
+        'lr': LogisticRegression(random_state=42, max_iter=1000, class_weight='balanced'),
+        'ridge': RidgeClassifier(random_state=42, class_weight='balanced'),
+        'sgd': SGDClassifier(random_state=42, max_iter=1000, class_weight='balanced'),
+        'pa': PassiveAggressiveClassifier(random_state=42, max_iter=1000, class_weight='balanced'),
+        'perceptron': Perceptron(random_state=42, max_iter=1000, class_weight='balanced'),
+        # Tree-Based Models
+        'dt': DecisionTreeClassifier(random_state=42, class_weight='balanced'),
+        'rf': RandomForestClassifier(random_state=42, n_jobs=-1, class_weight='balanced'),
+        'et': ExtraTreesClassifier(random_state=42, n_jobs=-1, class_weight='balanced'),
+        'gb': GradientBoostingClassifier(random_state=42), # ~10 times slower compared to the rest!
+        'hgb': HistGradientBoostingClassifier(random_state=42, class_weight='balanced'),
+        # Boosting Models
+        'xgb': XGBClassifier(random_state=42, n_jobs=-1, verbosity=0),
+        'lgbm': LGBMClassifier(random_state=42, n_jobs=-1, verbose=-1, class_weight='balanced'),
+        'ada': AdaBoostClassifier(random_state=42),
+        # Support Vector Models
+        'svc': SVC(random_state=42), # ~100 times slower compared to the rest!!!
+        'lsvc': LinearSVC(random_state=42, max_iter=1000), # Precision ill defined set to 0
+        # Instance-Based Models
+        'knn': KNeighborsClassifier(n_neighbors=5),
+        # Probabilistic Models
+        'gnb': GaussianNB(),
+        'qda': QuadraticDiscriminantAnalysis(reg_param=0.1), # Add regularization to handle singular covariance matrices
+        'lda': LinearDiscriminantAnalysis(),
+        # Neural Networks
+        'mlp': MLPClassifier(random_state=42, max_iter=500, early_stopping=True),
+        # Specialized Models
+        'dummy': DummyClassifier(strategy='most_frequent'), # Precision ill defined set to 0
+    }
+
+    if models == ['all']:
+        models = list(model_dict.keys())
+        # Exclude slow and weak models from 'all'
+        exclude_models = ['gb', 'svc', 'lsvc', 'qda', 'dummy']
+        models = [model for model in models if model not in exclude_models]
+
+    trained_models = {}
+    model_scores = {}
+    for model_name in models:
+        start = time.time()
+        print(f"\n{'='*50}")
+        print(f"Training {model_name.upper()}...")
+        print('='*50)
+
+        model = model_dict[model_name]
+        model.fit(X_train_processed, y_train_enc)
+
+        y_pred = model.predict(X_val_processed)
+        end = time.time()
+        print(f"Time taken: {end - start:.2f} seconds")
+        print(f"\nClassification Report for {model_name.upper()}:")
+        report = classification_report(y_val_enc, y_pred, output_dict=True, digits=3)
+        print(classification_report(y_val_enc, y_pred))
+
+        print(f"\nConfusion Matrix for {model_name.upper()}:")
+        print(confusion_matrix(y_val_enc, y_pred))
+
+        # Store trained model and its weighted avg f1-score
+        trained_models[model_name] = model
+        model_scores[model_name] = report['macro avg']['f1-score']
+
+    return trained_models, model_scores
+
+def find_best_model(trained_models, model_scores, combination_method=None):
+    # model_scores = {'model_name': weighted_avg_f1_score, ...}
+    if combination_method == 'soft_voting':
+        # Implement soft voting logic here (e.g., average probabilities)
+        # return voting_model
+        pass
+    elif combination_method == 'weighted_soft_voting':
+        # Implement weighted soft voting logic here (e.g., weighted average of probabilities)
+        # return weighted_voting_model
+        pass
+    elif combination_method == 'stacking':
+        # Implement stacking logic here (e.g., train a meta-model on the predictions of base models)
+        # return stacked_model
+        pass
+    elif combination_method == 'blending':
+        # Implement blending logic here (e.g., train a meta-model on a holdout set)
+        # return blended_model
+        pass
+    else:
+        best_model_name = max(model_scores, key=model_scores.get)
+        print(f"\n{'='*50}")
+        print(f"Best model: {best_model_name.upper()} with: {model_scores[best_model_name]:.4f}")
+        print('='*50)
+        best_model = trained_models[best_model_name]
+        return best_model
+
 def predict_test_data(test, preprocessor, model, le):
     # Apply the same preprocessing to test data
     test_processed = preprocessor.transform(test)
@@ -263,6 +359,10 @@ def predict_test_data(test, preprocessor, model, le):
 
     # Inverse transform to get original labels
     y_pred_labels = le.inverse_transform(y_pred)
+
+    print(f"\nTest predictions: {y_pred_labels}")
+    print(f"Unique predicted labels: {np.unique(y_pred_labels)}")
+    print(f"\nNumber of predictions: {len(y_pred_labels)}")
 
     return y_pred_labels
 
@@ -292,83 +392,16 @@ def main():
         preprocessor
     ) = preprocess_data(train, target_variable, test_size)
 
-    # Train and evaluate models
-    model_dict = {
-        # Linear Models
-        'lr': LogisticRegression(random_state=42, max_iter=1000, class_weight='balanced'),
-        'ridge': RidgeClassifier(random_state=42, class_weight='balanced'),
-        'sgd': SGDClassifier(random_state=42, max_iter=1000, class_weight='balanced'),
-        'pa': PassiveAggressiveClassifier(random_state=42, max_iter=1000, class_weight='balanced'),
-        'perceptron': Perceptron(random_state=42, max_iter=1000, class_weight='balanced'),
-        # Tree-Based Models
-        'dt': DecisionTreeClassifier(random_state=42, class_weight='balanced'),
-        'rf': RandomForestClassifier(random_state=42, n_jobs=-1, class_weight='balanced'),
-        'et': ExtraTreesClassifier(random_state=42, n_jobs=-1, class_weight='balanced'),
-        # 'gb': GradientBoostingClassifier(random_state=42), # ~10 times slower compared to the rest!
-        'hgb': HistGradientBoostingClassifier(random_state=42, class_weight='balanced'),
-        # Boosting Models
-        'xgb': XGBClassifier(random_state=42, n_jobs=-1, verbosity=0),
-        'lgbm': LGBMClassifier(random_state=42, n_jobs=-1, verbose=-1, class_weight='balanced'),
-        'ada': AdaBoostClassifier(random_state=42),
-        # Support Vector Models
-        'svc': SVC(random_state=42), # ~100 times slower compared to the rest!!!
-        # 'lsvc': LinearSVC(random_state=42, max_iter=1000), # Precision ill defined set to 0
-        # Instance-Based Models
-        'knn': KNeighborsClassifier(n_neighbors=5),
-        # Probabilistic Models
-        'gnb': GaussianNB(),
-        # 'qda': QuadraticDiscriminantAnalysis(reg_param=0.1), # Add regularization to handle singular covariance matrices
-        'lda': LinearDiscriminantAnalysis(),
-        # Neural Networks
-        'mlp': MLPClassifier(random_state=42, max_iter=500, early_stopping=True),
-        # Specialized Models
-        # 'dummy': DummyClassifier(strategy='most_frequent'), # Precision ill defined set to 0
-    }
+    trained_models, model_scores = train_and_evaluate_models(
+        X_train_processed, y_train_enc, X_val_processed, y_val_enc, models
+    )
 
-    # If 'all' is selected, use all models
-    if 'all' in models:
-        models = list(model_dict.keys())
-
-    # Train each model and store for prediction
-    trained_models = {}
-    model_scores = {}
-    for model_name in models:
-        start = time.time()
-        print(f"\n{'='*50}")
-        print(f"Training {model_name.upper()}...")
-        print('='*50)
-
-        model = model_dict[model_name]
-        model.fit(X_train_processed, y_train_enc)
-
-        y_pred = model.predict(X_val_processed)
-        end = time.time()
-        print(f"Time taken: {end - start:.2f} seconds")
-        print(f"\nClassification Report for {model_name.upper()}:")
-        report = classification_report(y_val_enc, y_pred, output_dict=True)
-        print(classification_report(y_val_enc, y_pred))
-
-        print(f"\nConfusion Matrix for {model_name.upper()}:")
-        print(confusion_matrix(y_val_enc, y_pred))
-
-        # Store trained model and its weighted avg f1-score
-        trained_models[model_name] = model
-        model_scores[model_name] = report['macro avg']['f1-score']
-
-    # Select the best model based on weighted avg f1-score
-    best_model_name = max(model_scores, key=model_scores.get)
-    print(f"\n{'='*50}")
-    print(f"Best model: {best_model_name.upper()} with weighted avg F1-score: {model_scores[best_model_name]:.4f}")
-    print('='*50)
-
-    best_model = trained_models[best_model_name]
+    best_model = find_best_model(trained_models,model_scores)
 
     test_predictions = predict_test_data(test, preprocessor, best_model, le)
-    print(f"\nTest predictions: {test_predictions}")
-    print(f"Unique predicted labels: {np.unique(test_predictions)}")
+    
 
     # Save predictions to a file or return them
-    print(f"\nNumber of predictions: {len(test_predictions)}")
     output = pd.DataFrame({'id': test_id, 'Irrigation_Need': test_predictions})
     output.to_csv(output_name, index=False)
     print(f"Predictions saved to {output_name}")
