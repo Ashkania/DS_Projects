@@ -1,22 +1,52 @@
 #!/usr/bin/env python
 
+#TODO:
+# 1. Add grid serach with the config file
+# 2. Combine predictors using ensemble methods:
+#     1. Soft voting, 2. Weighted soft voting, 3. Stacking, 4. Blending(?)
+#     Better to define a parameter to select only the best models for ensembling
+#     to not include the weak ones.
+# 3. Move the simple training with default models into a separate function
+# and call it from main.
+# 4. Activate SMOTE (and other sampling techniques) in the pipeline and compare results with and without it.
+# 5. Plot the results for each model and compare them visually.
+# 6. Add more evaluation metrics like ROC-AUC, Precision-Recall curves, etc.
+# 7. Add correlation matrix to EDA
+
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import time
 
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder, OrdinalEncoder, StandardScaler, OneHotEncoder
+from sklearn.preprocessing import (
+    LabelEncoder, OrdinalEncoder, StandardScaler, OneHotEncoder
+)
 from sklearn.compose import ColumnTransformer
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline
 from sklearn.model_selection import GridSearchCV
 
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import (
+    LogisticRegression, RidgeClassifier, SGDClassifier,
+    PassiveAggressiveClassifier, Perceptron
+)
 from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import (
+    RandomForestClassifier, ExtraTreesClassifier,
+    GradientBoostingClassifier, HistGradientBoostingClassifier,
+    AdaBoostClassifier, BaggingClassifier, VotingClassifier
+)
+from sklearn.svm import SVC, LinearSVC
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis, LinearDiscriminantAnalysis
+from sklearn.neural_network import MLPClassifier
+from sklearn.dummy import DummyClassifier
 
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
@@ -75,8 +105,31 @@ def command_line_args():
         '--models',
         nargs='+',
         default=['all'],
-        choices=['dt', 'rf', 'lr', 'all'],
-        help='Models to train: dt (Decision Tree), rf (Random Forest), lr (Logistic Regression), or all'
+        choices=[
+            'dt', 'rf', 'lr', 'ridge', 'sgd', 'pa', 'perceptron',
+            'et', 'gb', 'hgb', 'xgb', 'lgbm', 'ada', 'svc', 'lsvc',
+            'knn', 'gnb', 'qda', 'lda', 'mlp', 'dummy', 'all'
+            ],
+        help='Models to train: dt (Decision Tree), rf (Random Forest),' \
+        'lr (Logistic Regression), ridge (Ridge), sgd (SGD),' \
+        'pa (Passive Aggressive), perceptron, et (Extra Trees),' \
+        'gb (Gradient Boosting), hgb (HistGradient Boosting),' \
+        'xgb (XGBoost), lgbm (LightGBM), ada (AdaBoost), svc (SVC),' \
+        'lsvc (Linear SVC), knn (KNN), gnb (Gaussian NB), qda, lda,' \
+        'mlp (MLP), dummy, or all'
+    )
+    parser.add_argument(
+        '--grid-config-file',
+        type=str,
+        default=None,
+        help='Path to a JSON file containing grid search' \
+        'configurations for hyperparameter tuning'
+    )
+    parser.add_argument(
+        '--output',
+        type=str,
+        default='submission.csv',
+        help='Path to save the predictions'
     )
     return parser.parse_args()
 
@@ -198,35 +251,20 @@ def preprocess_data(train, target_variable, test_size):
     print(f"Processed training shape: {X_train_processed.shape}")
     print(f"Processed validation shape: {X_val_processed.shape}")
 
-    return X_train_processed, X_val_processed, y_train_enc, y_val_enc, le
+    return X_train_processed, X_val_processed, y_train_enc, y_val_enc, le, preprocessor
 
-def train_and_evaluate_models(X_train, X_val, y_train, y_val, models):
-    # Define model mappings
-    model_dict = {
-        'dt': DecisionTreeClassifier(random_state=42),
-        'rf': RandomForestClassifier(random_state=42, n_jobs=-1),
-        'lr': LogisticRegression(random_state=42, max_iter=1000)
-    }
+def predict_test_data(test, preprocessor, model, le):
+    # Apply the same preprocessing to test data
+    test_processed = preprocessor.transform(test)
+    print(f"Processed test shape: {test_processed.shape}")
 
-    # If 'all' is selected, use all models
-    if 'all' in models:
-        models = ['dt', 'rf', 'lr']
+    # Make predictions
+    y_pred = model.predict(test_processed)
 
-    for model_name in models:
-        print(f"\n{'='*50}")
-        print(f"Training {model_name.upper()}...")
-        print('='*50)
+    # Inverse transform to get original labels
+    y_pred_labels = le.inverse_transform(y_pred)
 
-        model = model_dict[model_name]
-        model.fit(X_train, y_train)
-
-        y_pred = model.predict(X_val)
-
-        print(f"\nClassification Report for {model_name.upper()}:")
-        print(classification_report(y_val, y_pred))
-
-        print(f"\nConfusion Matrix for {model_name.upper()}:")
-        print(confusion_matrix(y_val, y_pred))
+    return y_pred_labels
 
 def main():
     args = command_line_args()
@@ -235,17 +273,106 @@ def main():
     test_size = args.test_size
     drop_columns = args.drop_columns
     models = args.models
+    output_name = args.output
 
-    train, test, test_id = load_data(train_path, test_path, drop_columns)
+    train, test, test_id = load_data(
+        train_path, test_path, drop_columns
+    )
     target_variable = args.target_variable or train.columns[-1]
 
     if args.eda:
         eda(train, target_variable)
 
-    X_train_processed, X_val_processed, y_train_enc, y_val_enc, le = preprocess_data(train, target_variable, test_size)
+    (
+        X_train_processed,
+        X_val_processed,
+        y_train_enc,
+        y_val_enc,
+        le,
+        preprocessor
+    ) = preprocess_data(train, target_variable, test_size)
 
-    train_and_evaluate_models(X_train_processed, X_val_processed, y_train_enc, y_val_enc, models)
-        
+    # Train and evaluate models
+    model_dict = {
+        # Linear Models
+        'lr': LogisticRegression(random_state=42, max_iter=1000, class_weight='balanced'),
+        'ridge': RidgeClassifier(random_state=42, class_weight='balanced'),
+        'sgd': SGDClassifier(random_state=42, max_iter=1000, class_weight='balanced'),
+        'pa': PassiveAggressiveClassifier(random_state=42, max_iter=1000, class_weight='balanced'),
+        'perceptron': Perceptron(random_state=42, max_iter=1000, class_weight='balanced'),
+        # Tree-Based Models
+        'dt': DecisionTreeClassifier(random_state=42, class_weight='balanced'),
+        'rf': RandomForestClassifier(random_state=42, n_jobs=-1, class_weight='balanced'),
+        'et': ExtraTreesClassifier(random_state=42, n_jobs=-1, class_weight='balanced'),
+        # 'gb': GradientBoostingClassifier(random_state=42), # ~10 times slower compared to the rest!
+        'hgb': HistGradientBoostingClassifier(random_state=42, class_weight='balanced'),
+        # Boosting Models
+        'xgb': XGBClassifier(random_state=42, n_jobs=-1, verbosity=0),
+        'lgbm': LGBMClassifier(random_state=42, n_jobs=-1, verbose=-1, class_weight='balanced'),
+        'ada': AdaBoostClassifier(random_state=42),
+        # Support Vector Models
+        'svc': SVC(random_state=42), # ~100 times slower compared to the rest!!!
+        # 'lsvc': LinearSVC(random_state=42, max_iter=1000), # Precision ill defined set to 0
+        # Instance-Based Models
+        'knn': KNeighborsClassifier(n_neighbors=5),
+        # Probabilistic Models
+        'gnb': GaussianNB(),
+        # 'qda': QuadraticDiscriminantAnalysis(reg_param=0.1), # Add regularization to handle singular covariance matrices
+        'lda': LinearDiscriminantAnalysis(),
+        # Neural Networks
+        'mlp': MLPClassifier(random_state=42, max_iter=500, early_stopping=True),
+        # Specialized Models
+        # 'dummy': DummyClassifier(strategy='most_frequent'), # Precision ill defined set to 0
+    }
+
+    # If 'all' is selected, use all models
+    if 'all' in models:
+        models = list(model_dict.keys())
+
+    # Train each model and store for prediction
+    trained_models = {}
+    model_scores = {}
+    for model_name in models:
+        start = time.time()
+        print(f"\n{'='*50}")
+        print(f"Training {model_name.upper()}...")
+        print('='*50)
+
+        model = model_dict[model_name]
+        model.fit(X_train_processed, y_train_enc)
+
+        y_pred = model.predict(X_val_processed)
+        end = time.time()
+        print(f"Time taken: {end - start:.2f} seconds")
+        print(f"\nClassification Report for {model_name.upper()}:")
+        report = classification_report(y_val_enc, y_pred, output_dict=True)
+        print(classification_report(y_val_enc, y_pred))
+
+        print(f"\nConfusion Matrix for {model_name.upper()}:")
+        print(confusion_matrix(y_val_enc, y_pred))
+
+        # Store trained model and its weighted avg f1-score
+        trained_models[model_name] = model
+        model_scores[model_name] = report['macro avg']['f1-score']
+
+    # Select the best model based on weighted avg f1-score
+    best_model_name = max(model_scores, key=model_scores.get)
+    print(f"\n{'='*50}")
+    print(f"Best model: {best_model_name.upper()} with weighted avg F1-score: {model_scores[best_model_name]:.4f}")
+    print('='*50)
+
+    best_model = trained_models[best_model_name]
+
+    test_predictions = predict_test_data(test, preprocessor, best_model, le)
+    print(f"\nTest predictions: {test_predictions}")
+    print(f"Unique predicted labels: {np.unique(test_predictions)}")
+
+    # Save predictions to a file or return them
+    print(f"\nNumber of predictions: {len(test_predictions)}")
+    output = pd.DataFrame({'id': test_id, 'Irrigation_Need': test_predictions})
+    output.to_csv(output_name, index=False)
+    print(f"Predictions saved to {output_name}")
+
     print('Done!')
 
 if __name__ == '__main__':
