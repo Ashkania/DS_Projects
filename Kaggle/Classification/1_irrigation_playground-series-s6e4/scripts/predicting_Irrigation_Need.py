@@ -17,7 +17,6 @@
 # 6. Add more evaluation metrics like ROC-AUC, Precision-Recall curves, etc.
 # 7. Add correlation matrix to EDA
 # 8. Add feature importance plots for tree-based models.
-# 9. train the final model on the entire training data (train + val) before making predictions on test data.
 
 # Hardcoded parameters:
 # 1. saved score in models score dict is weighted avg f1-score, but it can be changed to any other metric.
@@ -62,6 +61,7 @@ from sklearn.dummy import DummyClassifier
 
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
 
 from sklearn.metrics import classification_report, confusion_matrix
 
@@ -109,7 +109,7 @@ def command_line_args():
         help='Perform exploratory data analysis'
     )
     parser.add_argument(
-        '--test_size',
+        '--test-size',
         type=float,
         default=0.2,
         help='Proportion of the dataset to include in the test split'
@@ -121,7 +121,7 @@ def command_line_args():
         choices=[
             'dt', 'rf', 'lr', 'ridge', 'sgd', 'pa', 'perceptron',
             'et', 'gb', 'hgb', 'xgb', 'lgbm', 'ada', 'svc', 'lsvc',
-            'knn', 'gnb', 'qda', 'lda', 'mlp', 'dummy', 'all'
+            'knn', 'gnb', 'qda', 'lda', 'mlp', 'dummy', 'cat', 'all'
             ],
         help='Models to train: dt (Decision Tree), rf (Random Forest),' \
         'lr (Logistic Regression), ridge (Ridge), sgd (SGD),' \
@@ -138,6 +138,11 @@ def command_line_args():
         help='Doing cross validation with the specified number of folds (e.g., 5 for 5-fold CV)'
     )
     parser.add_argument(
+        '--imbalance',
+        default=False,
+        choices=['smote','other']
+    )
+    parser.add_argument(
         '--grid-config-file',
         type=str,
         default=None,
@@ -145,9 +150,19 @@ def command_line_args():
         'configurations for hyperparameter tuning'
     )
     parser.add_argument(
+        '--models-to-combine',
+        nargs='+',
+        default=None,
+        choices=[
+            'dt', 'rf', 'lr', 'ridge', 'sgd', 'pa', 'perceptron',
+            'et', 'gb', 'hgb', 'xgb', 'lgbm', 'ada', 'svc', 'lsvc',
+            'knn', 'gnb', 'qda', 'lda', 'mlp', 'dummy', 'cat', 'all'
+            ]
+    )
+    parser.add_argument(
         '--output',
         type=str,
-        default='submission.csv',
+        default='../output/submission/submission.csv',
         help='Path to save the predictions'
     )
     return parser.parse_args()
@@ -275,7 +290,8 @@ def preprocess_data(train, target_variable, test_size):
 def train_and_evaluate_models(
         X_train_processed, y_train_enc,
         X_val_processed, y_val_enc,
-        models, cv=False, grid_config_file=None
+        models, cv=False, grid_config_file=None,
+        imbalance=False
     ):
     model_dict = {
         # Linear Models
@@ -307,6 +323,7 @@ def train_and_evaluate_models(
         'mlp': MLPClassifier(random_state=42, max_iter=500, early_stopping=True),
         # Specialized Models
         'dummy': DummyClassifier(strategy='most_frequent'), # Precision ill defined set to 0
+        'cat' : CatBoostClassifier(random_state=42, verbose=0),
     }
     if models == ['all']:
         models = list(model_dict.keys())
@@ -344,6 +361,15 @@ def train_and_evaluate_models(
             print('='*50)
             
             model = model_dict[model_name]
+
+            if imbalance:
+                if imbalance=='smote':
+                    smote = SMOTE(random_state=42)
+                    X_train_processed, y_train_enc = smote.fit_resample(
+                        X_train_processed,
+                        y_train_enc
+                    )
+                
 
             cv_results = cross_validate(
                 model, X_train_processed, y_train_enc,
@@ -385,6 +411,14 @@ def train_and_evaluate_models(
             print('='*50)
 
             model = model_dict[model_name]
+
+            if imbalance:
+                if imbalance=='smote':
+                    smote = SMOTE(random_state=42)
+                    X_train_processed, y_train_enc = smote.fit_resample(
+                        X_train_processed,
+                        y_train_enc
+                    )
 
             model.fit(X_train_processed, y_train_enc)
             y_pred = model.predict(X_val_processed)
@@ -458,6 +492,7 @@ def predict_test_data(test, preprocessor, model, le):
     # model.fit(X_train_processed, y_train_enc)
 
     # Make predictions
+    print(y_pred.shape)
     y_pred = model.predict(test_processed)
 
     # Inverse transform to get original labels
@@ -479,6 +514,8 @@ def main():
     output_name = args.output
     cv=args.cv
     grid_config_file=args.grid_config_file
+    models_to_combined = args.models_to_combine
+    imbalance = args.imbalance
 
     train, test, test_id = load_data(
         train_path, test_path, drop_columns
@@ -503,15 +540,16 @@ def main():
     # )
 
     # now for the cv and non cv cases, the best model is already selected in the train_and_evaluate_models function
-    
-    best_model = train_and_evaluate_models(
-        X_train_processed, y_train_enc, X_val_processed, y_val_enc, models, cv, grid_config_file
-    )
-
-
-    # best_model = find_best_model(trained_models,model_scores)
-
-    test_predictions = predict_test_data(test, preprocessor, best_model, le)
+    if models_to_combined:
+        pass
+        # we should return the master combined model or directly the aggregated predictions and jump to saving the result
+    else:
+        best_model = train_and_evaluate_models(
+            X_train_processed, y_train_enc,
+            X_val_processed, y_val_enc, models,
+            cv, grid_config_file, imbalance
+        )
+        test_predictions = predict_test_data(test, preprocessor, best_model, le)
     
 
     # Save predictions to a file or return them
