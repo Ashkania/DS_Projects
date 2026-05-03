@@ -44,6 +44,7 @@ from imblearn.over_sampling import SMOTE, RandomOverSampler
 from imblearn.under_sampling import RandomUnderSampler
 from imblearn.pipeline import Pipeline as ImbPipeline
 from sklearn.model_selection import GridSearchCV, cross_validate
+from sklearn.multiclass import OneVsRestClassifier
 
 from sklearn.linear_model import (
     LogisticRegression, RidgeClassifier, SGDClassifier,
@@ -124,7 +125,7 @@ def command_line_args():
         choices=[
             'dt', 'rf', 'lr', 'ridge', 'sgd', 'pa', 'perceptron',
             'et', 'gb', 'hgb', 'xgb', 'lgbm', 'ada', 'svc', 'lsvc',
-            'knn', 'gnb', 'qda', 'lda', 'mlp', 'dummy', 'cat', 'all'
+            'knn', 'gnb', 'qda', 'lda', 'mlp', 'dummy', 'cat', 'rf_ovr', 'all'
             ],
         help='Models to train: dt (Decision Tree), rf (Random Forest),' \
         'lr (Logistic Regression), ridge (Ridge), sgd (SGD),' \
@@ -303,7 +304,7 @@ def train_and_evaluate_models(
         X_train_processed, y_train_enc,
         X_val_processed, y_val_enc,
         models, cv=False, grid_config_file=None,
-        imbalance=False
+        imbalance=False, le=None
     ):
     model_dict = {
         # Linear Models
@@ -336,6 +337,9 @@ def train_and_evaluate_models(
         # Specialized Models
         'dummy': DummyClassifier(strategy='most_frequent'), # Precision ill defined set to 0
         'cat' : CatBoostClassifier(random_state=42, verbose=0),
+        'rf_ovr': OneVsRestClassifier(
+            RandomForestClassifier(random_state=42, n_jobs=-1, class_weight='balanced')
+        ),
     }
     if models == ['all']:
         models = list(model_dict.keys())
@@ -510,7 +514,27 @@ def train_and_evaluate_models(
             print(f"\nConfusion Matrix for {model_name.upper()}:")
             cm = confusion_matrix(y_val_enc, y_pred)
             print(cm)
-            sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+            # Show readable class names on axis ticks if LabelEncoder is available
+            # if le is not None and hasattr(le, 'classes_'):
+            #     try:
+            class_indices = np.arange(len(le.classes_))
+            class_names = le.inverse_transform(class_indices)
+            #     except Exception:
+            #         class_names = [str(i) for i in range(cm.shape[0])]
+            # else:
+            #     class_names = [str(i) for i in range(cm.shape[0])]
+
+            sns.heatmap(
+                cm,
+                annot=True,
+                fmt="d",
+                cmap="Blues",
+                xticklabels=class_names,
+                yticklabels=class_names
+            )
+            plt.xlabel('Predicted')
+            plt.ylabel('True')
+            plt.title(f"Confusion Matrix for {model_name.upper()}")
             plt.show()
 
         best_model_name = max(model_scores, key=model_scores.get)
@@ -628,7 +652,7 @@ def main():
             best_model = train_and_evaluate_models(
                 X_train_processed, y_train_enc,
                 X_val_processed, y_val_enc, models,
-                cv, grid_config_file, imbalance
+                cv, grid_config_file, imbalance, le
             )
             test_predictions = predict_test_data(test, preprocessor, best_model, le)
         
@@ -642,3 +666,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
