@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 
 #TODO:
+####### finish the gemini edits on using pipeline for imbalance. did it on cv, and default, do it on grid part
+####### add to anki and to the report how the cm means taht the models does not confuse low and high
 # 0. Add CV, should edit the best model selection: for no cv and cv, do it inside the
 #     train_and_evaluate_models function and return the best model from there.
 #     So, the find_best_model function will be only for ensembling methods.
@@ -38,8 +40,9 @@ from sklearn.preprocessing import (
     LabelEncoder, OrdinalEncoder, StandardScaler, OneHotEncoder
 )
 from sklearn.compose import ColumnTransformer
-from imblearn.over_sampling import SMOTE
-from imblearn.pipeline import Pipeline
+from imblearn.over_sampling import SMOTE, RandomOverSampler
+from imblearn.under_sampling import RandomUnderSampler
+from imblearn.pipeline import Pipeline as ImbPipeline
 from sklearn.model_selection import GridSearchCV, cross_validate
 
 from sklearn.linear_model import (
@@ -75,8 +78,9 @@ def command_line_args():
             and prepares the data for modeling.
             Usage:
             ./predicting_Irrigation_Need.py --train-dataset ../data/train.csv
-            --test-dataset ../data/test.csv --drop-columns id --eda
-            --models all --cv 5
+            --test-dataset ../data/test.csv [--drop-columns id] [--eda]
+            [--models all] [--cv 5] [--imbalance smote]
+            [--grid-config-file ../data/grid_config.cfg]
             """
         )
     parser.add_argument(
@@ -117,7 +121,6 @@ def command_line_args():
     parser.add_argument(
         '--models',
         nargs='+',
-        default=['all'],
         choices=[
             'dt', 'rf', 'lr', 'ridge', 'sgd', 'pa', 'perceptron',
             'et', 'gb', 'hgb', 'xgb', 'lgbm', 'ada', 'svc', 'lsvc',
@@ -287,6 +290,15 @@ def preprocess_data(train, target_variable, test_size):
 
     return X_train_processed, X_val_processed, y_train_enc, y_val_enc, le, preprocessor
 
+
+def get_resampler(imbalance_type):
+
+    if imbalance_type == 'smote':
+            return SMOTE(random_state=42)
+    elif imbalance_type == 'under':
+        return RandomUnderSampler(random_state=42)
+    return None
+
 def train_and_evaluate_models(
         X_train_processed, y_train_enc,
         X_val_processed, y_val_enc,
@@ -332,52 +344,109 @@ def train_and_evaluate_models(
         models = [model for model in models if model not in exclude_models]
 
     if grid_config_file:
-        pass
-        # Load grid search configurations from the specified JSON file
-        # with open(grid_config_file, 'r') as f:
-        #     grid_configs = json.load(f)
-        # # Update model_dict with the specified hyperparameters for grid search
-        # for model_name, params in grid_configs.items():
-        #     if model_name in model_dict:
-        #         model_dict[model_name] = GridSearchCV(
-        #             estimator=model_dict[model_name],
-        #             param_grid=params,
-        #             cv=cv if cv else 5,
-        #             n_jobs=-1,
-        #             verbose=1
-        #         )
-        #     else:
-        #         print(f"Warning: Model '{model_name}' not found in model_dict. Skipping grid search for this model.")
-        #### for now, return only the best model here too.
+        model_scores = {}
+        best_estimators = {}
+
+        with open(grid_config_file, 'r') as f:
+            grid_configs = json.load(f)
+
+        # Update model_dict with the specified hyperparameters for grid search
+        for model_name in models:
+            if model_name not in model_dict:
+                print(f"Warning: Model '{model_name}' is not recognized. Skipping.")
+                continue
+            else:
+                base_model = model_dict[model_name]
+
+            params = grid_configs.get(model_name, {})
+            
+            if imbalance:
+                resampler = get_resampler(imbalance)  # = SMOTE()
+                estimator_to_use = ImbPipeline([
+                    ('resampler', resampler),
+                    ('model', base_model)
+                ])
+                # When using a pipeline, GridSearch needs like model__max_depth() so:
+                pipeline_params = {f'model__{key}': val for key, val in params.items()}
+            else:
+                estimator_to_use = base_model
+                pipeline_params = params
+
+            start = time.time()
+
+            print(f"\n{'='*50}")
+            print(f"Training {model_name.upper()}...")
+            print('='*50)
+
+            grid_search = GridSearchCV(
+                estimator=estimator_to_use,
+                param_grid=pipeline_params,
+                cv=cv if cv else 5,
+                scoring='f1_macro',
+                n_jobs=-1,
+                verbose=1
+            )
+
+            grid_search.fit(X_train_processed, y_train_enc)
+
+            end = time.time()
+
+            best_score = grid_search.best_score_
+            model_scores[model_name] = best_score
+            best_estimators[model_name] = grid_search.best_estimator_
+
+            print(f"Time taken: {end - start:.2f} seconds")
+            print(f"Best Parameters for {model_name.upper()}: {grid_search.best_params_}")
+            print(f"Best CV Macro F1-Score: {best_score:.4f}")
+
+        best_model_name = max(model_scores, key=model_scores.get)
+        best_model = best_estimators[best_model_name]
+
+        print(f"\n{'='*50}")
+        print(f"Overall Best model: {best_model_name.upper()} with CV Macro F1-Score: {model_scores[best_model_name]:.4f}")
+        print('='*50)
+
+        print("Refitting the best model on the combined train and validation sets...")
+        best_model.fit(
+            np.concatenate([X_train_processed, X_val_processed]),
+            np.concatenate([y_train_enc, y_val_enc])
+        )
+
     elif cv:
         model_scores = {}
+        best_pipelines = {}
         
         for model_name in models:
             
             start = time.time()
-            
             print(f"\n{'='*50}")
             print(f"Training {model_name.upper()}...")
             print('='*50)
             
-            model = model_dict[model_name]
+            base_model = model_dict[model_name]
 
             if imbalance:
-                if imbalance=='smote':
-                    smote = SMOTE(random_state=42)
-                    X_train_processed, y_train_enc = smote.fit_resample(
-                        X_train_processed,
-                        y_train_enc
-                    )
+                resampler = get_resampler(imbalance)  # = SMOTE()
+                estimator_to_use = ImbPipeline([
+                    ('resampler', resampler),
+                    ('model', base_model)
+                ])
+            else:
+                estimator_to_use = base_model
                 
-
             cv_results = cross_validate(
-                model, X_train_processed, y_train_enc,
-                cv=cv, scoring=['f1_macro', 'f1_weighted'], n_jobs=-1
+                estimator_to_use,
+                X_train_processed,
+                y_train_enc,
+                cv=cv,
+                scoring=['f1_macro', 'f1_weighted'],
+                n_jobs=-1
             )
 
             mean_score = cv_results['test_f1_macro'].mean()
             model_scores[model_name] = mean_score
+
+            best_pipelines[model_name] = estimator_to_use
 
             end = time.time()
 
@@ -388,8 +457,13 @@ def train_and_evaluate_models(
         # first find the best model based on cv scores, then fit it on the entire training data (train + val) before making predictions on test data
         # Fit once on full training data for later use in test prediction
         best_model_name = max(model_scores, key=model_scores.get)
-        best_model = model_dict[best_model_name]
+        best_model = best_pipelines[best_model_name]
 
+        print(f"\n{'='*50}")
+        print(f"Best model: {best_model_name.upper()} with CV Macro F1-Score: {model_scores[best_model_name]:.4f}")
+        print('='*50)
+
+        print(f"Refitting the best pipeline ({best_model_name.upper()}) on the combined train and validation sets...")
         # train on the entire training data (train + val) before making predictions on test data.
         best_model.fit(
             np.concatenate([X_train_processed, X_val_processed]),
@@ -402,6 +476,7 @@ def train_and_evaluate_models(
 
     else:
         model_scores = {}
+        best_pipelines = {}
         
         for model_name in models:
             
@@ -410,20 +485,22 @@ def train_and_evaluate_models(
             print(f"Training {model_name.upper()}...")
             print('='*50)
 
-            model = model_dict[model_name]
+            base_model = model_dict[model_name]
 
             if imbalance:
-                if imbalance=='smote':
-                    smote = SMOTE(random_state=42)
-                    X_train_processed, y_train_enc = smote.fit_resample(
-                        X_train_processed,
-                        y_train_enc
-                    )
+                resampler = get_resampler(imbalance)  # = SMOTE()
+                estimator_to_use = ImbPipeline([
+                    ('resampler', resampler),
+                    ('model', base_model)
+                ])
+            else:
+                estimator_to_use = base_model
 
-            model.fit(X_train_processed, y_train_enc)
-            y_pred = model.predict(X_val_processed)
+            estimator_to_use.fit(X_train_processed, y_train_enc)
+            y_pred = estimator_to_use.predict(X_val_processed)
             report = classification_report(y_val_enc, y_pred, output_dict=True, digits=3)
             model_scores[model_name] = report['macro avg']['f1-score']
+            best_pipelines[model_name] = estimator_to_use
 
             end = time.time()
             
@@ -431,20 +508,24 @@ def train_and_evaluate_models(
             print(f"\nClassification Report for {model_name.upper()}:")
             print(classification_report(y_val_enc, y_pred, digits=3))
             print(f"\nConfusion Matrix for {model_name.upper()}:")
-            print(confusion_matrix(y_val_enc, y_pred))
+            cm = confusion_matrix(y_val_enc, y_pred)
+            print(cm)
+            sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+            plt.show()
 
         best_model_name = max(model_scores, key=model_scores.get)
-        best_model = model_dict[best_model_name]
+        best_model = best_pipelines[best_model_name]
 
+        print(f"\n{'='*50}")
+        print(f"Best model: {best_model_name.upper()} with Validation Macro F1-Score: {model_scores[best_model_name]:.4f}")
+        print('='*50)
+
+        print(f"Refitting the best pipeline ({best_model_name.upper()}) on the combined train and validation sets...")
         # train on the entire training data (train + val) before making predictions on test data.
         best_model.fit(
             np.concatenate([X_train_processed, X_val_processed]),
             np.concatenate([y_train_enc, y_val_enc])
         )
-
-        print(f"\n{'='*50}")
-        print(f"Best model: {best_model_name.upper()} with Validation Macro F1-Score: {model_scores[best_model_name]:.4f}")
-        print('='*50)
 
 
     return best_model 
@@ -492,7 +573,6 @@ def predict_test_data(test, preprocessor, model, le):
     # model.fit(X_train_processed, y_train_enc)
 
     # Make predictions
-    print(y_pred.shape)
     y_pred = model.predict(test_processed)
 
     # Inverse transform to get original labels
@@ -525,37 +605,38 @@ def main():
     if args.eda:
         eda(train, target_variable)
 
-    (
-        X_train_processed,
-        X_val_processed,
-        y_train_enc,
-        y_val_enc,
-        le,
-        preprocessor
-    ) = preprocess_data(train, target_variable, test_size)
+    if models:
+        (
+            X_train_processed,
+            X_val_processed,
+            y_train_enc,
+            y_val_enc,
+            le,
+            preprocessor
+        ) = preprocess_data(train, target_variable, test_size)
 
-    # before:
-    # trained_models, model_scores = train_and_evaluate_models(
-    #     X_train_processed, y_train_enc, X_val_processed, y_val_enc, models, cv, grid_config_file
-    # )
+        # before:
+        # trained_models, model_scores = train_and_evaluate_models(
+        #     X_train_processed, y_train_enc, X_val_processed, y_val_enc, models, cv, grid_config_file
+        # )
 
-    # now for the cv and non cv cases, the best model is already selected in the train_and_evaluate_models function
-    if models_to_combined:
-        pass
-        # we should return the master combined model or directly the aggregated predictions and jump to saving the result
-    else:
-        best_model = train_and_evaluate_models(
-            X_train_processed, y_train_enc,
-            X_val_processed, y_val_enc, models,
-            cv, grid_config_file, imbalance
-        )
-        test_predictions = predict_test_data(test, preprocessor, best_model, le)
-    
+        # now for the cv and non cv cases, the best model is already selected in the train_and_evaluate_models function
+        if models_to_combined:
+            pass
+            # we should return the master combined model or directly the aggregated predictions and jump to saving the result
+        else:
+            best_model = train_and_evaluate_models(
+                X_train_processed, y_train_enc,
+                X_val_processed, y_val_enc, models,
+                cv, grid_config_file, imbalance
+            )
+            test_predictions = predict_test_data(test, preprocessor, best_model, le)
+        
 
-    # Save predictions to a file or return them
-    output = pd.DataFrame({'id': test_id, 'Irrigation_Need': test_predictions})
-    output.to_csv(output_name, index=False)
-    print(f"Predictions saved to {output_name}")
+        # Save predictions to a file or return them
+        output = pd.DataFrame({'id': test_id, 'Irrigation_Need': test_predictions})
+        output.to_csv(output_name, index=False)
+        print(f"Predictions saved to {output_name}")
 
     print('Done!')
 
