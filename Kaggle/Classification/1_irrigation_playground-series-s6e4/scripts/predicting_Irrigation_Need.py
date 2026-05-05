@@ -39,6 +39,7 @@ from sklearn.model_selection import cross_val_predict, train_test_split
 from sklearn.preprocessing import (
     LabelEncoder, OrdinalEncoder, StandardScaler, OneHotEncoder
 )
+from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from imblearn.over_sampling import SMOTE, RandomOverSampler
 from imblearn.under_sampling import RandomUnderSampler
@@ -54,7 +55,7 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import (
     RandomForestClassifier, ExtraTreesClassifier,
     GradientBoostingClassifier, HistGradientBoostingClassifier,
-    AdaBoostClassifier, BaggingClassifier, VotingClassifier
+    AdaBoostClassifier, BaggingClassifier, VotingClassifier, StackingClassifier
 )
 from sklearn.svm import SVC, LinearSVC
 from sklearn.neighbors import KNeighborsClassifier
@@ -170,6 +171,9 @@ def command_line_args():
         help='Path to save the predictions'
     )
     return parser.parse_args()
+
+
+
 
 def load_data(train_path, test_path, drop_columns=[]):
     train = pd.read_csv(train_path)
@@ -300,17 +304,14 @@ def get_resampler(imbalance_type):
         return RandomUnderSampler(random_state=42)
     return None
 
-def train_and_evaluate_models(
-        X_train_processed, y_train_enc,
-        X_val_processed, y_val_enc,
-        models, cv=False, grid_config_file=None,
-        imbalance=False, le=None
-    ):
+
+def get_model_dict(models_to_combine=None):
+    """Stores base models and dynamically creates ensembles if requested."""
     model_dict = {
         # Linear Models
         'lr': LogisticRegression(random_state=42, max_iter=1000, class_weight='balanced'),
         'ridge': RidgeClassifier(random_state=42, class_weight='balanced'),
-        'sgd': SGDClassifier(random_state=42, max_iter=1000, class_weight='balanced'),
+        'sgd': SGDClassifier(random_state=42, max_iter=1000, class_weight='balanced', loss='log_loss'),
         'pa': PassiveAggressiveClassifier(random_state=42, max_iter=1000, class_weight='balanced'),
         'perceptron': Perceptron(random_state=42, max_iter=1000, class_weight='balanced'),
         # Tree-Based Models
@@ -337,222 +338,204 @@ def train_and_evaluate_models(
         # Specialized Models
         'dummy': DummyClassifier(strategy='most_frequent'), # Precision ill defined set to 0
         'cat' : CatBoostClassifier(random_state=42, verbose=0),
+        # One vs Rest
         'rf_ovr': OneVsRestClassifier(
             RandomForestClassifier(random_state=42, n_jobs=-1, class_weight='balanced')
         ),
     }
-    if models == ['all']:
-        models = list(model_dict.keys())
-        # Exclude slow and weak models from 'all'
-        exclude_models = ['gb', 'svc', 'lsvc', 'qda', 'dummy']
-        models = [model for model in models if model not in exclude_models]
 
-    if grid_config_file:
-        model_scores = {}
-        best_estimators = {}
-
-        with open(grid_config_file, 'r') as f:
-            grid_configs = json.load(f)
-
-        # Update model_dict with the specified hyperparameters for grid search
-        for model_name in models:
-            if model_name not in model_dict:
-                print(f"Warning: Model '{model_name}' is not recognized. Skipping.")
-                continue
-            else:
-                base_model = model_dict[model_name]
-
-            params = grid_configs.get(model_name, {})
-            
-            if imbalance:
-                resampler = get_resampler(imbalance)  # = SMOTE()
-                estimator_to_use = ImbPipeline([
-                    ('resampler', resampler),
-                    ('model', base_model)
-                ])
-                # When using a pipeline, GridSearch needs like model__max_depth() so:
-                pipeline_params = {f'model__{key}': val for key, val in params.items()}
-            else:
-                estimator_to_use = base_model
-                pipeline_params = params
-
-            start = time.time()
-
-            print(f"\n{'='*50}")
-            print(f"Training {model_name.upper()}...")
-            print('='*50)
-
-            grid_search = GridSearchCV(
-                estimator=estimator_to_use,
-                param_grid=pipeline_params,
-                cv=cv if cv else 5,
-                scoring='f1_macro',
-                n_jobs=-1,
-                verbose=1
-            )
-
-            grid_search.fit(X_train_processed, y_train_enc)
-
-            end = time.time()
-
-            best_score = grid_search.best_score_
-            model_scores[model_name] = best_score
-            best_estimators[model_name] = grid_search.best_estimator_
-
-            print(f"Time taken: {end - start:.2f} seconds")
-            print(f"Best Parameters for {model_name.upper()}: {grid_search.best_params_}")
-            print(f"Best CV Macro F1-Score: {best_score:.4f}")
-
-        best_model_name = max(model_scores, key=model_scores.get)
-        best_model = best_estimators[best_model_name]
-
-        print(f"\n{'='*50}")
-        print(f"Overall Best model: {best_model_name.upper()} with CV Macro F1-Score: {model_scores[best_model_name]:.4f}")
-        print('='*50)
-
-        print("Refitting the best model on the combined train and validation sets...")
-        best_model.fit(
-            np.concatenate([X_train_processed, X_val_processed]),
-            np.concatenate([y_train_enc, y_val_enc])
-        )
-
-    elif cv:
-        model_scores = {}
-        best_pipelines = {}
+    # Dynamically build ensembles if the user provided a list of models
+    if models_to_combine:
+        # Create the [('name', model_obj)] list required by Sklearn
+        # We use clone() so the ensemble gets fresh instances, not shared memory
+        estimators = [
+            (name, clone(model_dict[name])) 
+            for name in models_to_combine if name in model_dict
+        ]
         
-        for model_name in models:
-            
-            start = time.time()
-            print(f"\n{'='*50}")
-            print(f"Training {model_name.upper()}...")
-            print('='*50)
-            
-            base_model = model_dict[model_name]
-
-            if imbalance:
-                resampler = get_resampler(imbalance)  # = SMOTE()
-                estimator_to_use = ImbPipeline([
-                    ('resampler', resampler),
-                    ('model', base_model)
-                ])
-            else:
-                estimator_to_use = base_model
-                
-            cv_results = cross_validate(
-                estimator_to_use,
-                X_train_processed,
-                y_train_enc,
-                cv=cv,
-                scoring=['f1_macro', 'f1_weighted'],
+        if estimators:
+            model_dict['custom_voting'] = VotingClassifier(
+                estimators=estimators, voting='soft', n_jobs=-1  # if error for models without a probability: have to use hard voting
+            )
+            model_dict['custom_stacking'] = StackingClassifier(
+                estimators=estimators,
+                final_estimator=LogisticRegression(class_weight='balanced'),
                 n_jobs=-1
             )
+            
+    return model_dict
 
-            mean_score = cv_results['test_f1_macro'].mean()
-            model_scores[model_name] = mean_score
 
-            best_pipelines[model_name] = estimator_to_use
+def build_pipeline(model, imbalance_type=False):
+    """Wraps the model in an imblearn pipeline if necessary."""
+    if imbalance_type:
+        resampler = get_resampler(imbalance_type) # Assuming you have this helper function
+        return ImbPipeline([('resampler', resampler), ('model', model)])
+    return model
 
-            end = time.time()
+def run_grid_search(
+        X_train, y_train,
+        models, model_dict,
+        grid_config_file,
+        cv, imbalance
+    ):
+    """Handles Grid Search CV logic."""
+    with open(grid_config_file, 'r') as f:
+        grid_configs = json.load(f)
 
-            print(f"Time taken: {end - start:.2f} seconds")
-            print(f"Cross-Validation Results for {model_name.upper()}:")
-            print(f"Mean Macro F1-Score: {mean_score:.4f}")
+    model_scores, best_estimators = {}, {}
 
-        # first find the best model based on cv scores, then fit it on the entire training data (train + val) before making predictions on test data
-        # Fit once on full training data for later use in test prediction
-        best_model_name = max(model_scores, key=model_scores.get)
-        best_model = best_pipelines[best_model_name]
+    for model_name in models:
+        if model_name not in model_dict:
+            continue
+            
+        base_model = model_dict[model_name]
+        params = grid_configs.get(model_name, {})
+        estimator_to_use = build_pipeline(base_model, imbalance)
 
-        print(f"\n{'='*50}")
-        print(f"Best model: {best_model_name.upper()} with CV Macro F1-Score: {model_scores[best_model_name]:.4f}")
-        print('='*50)
+        # Prepend 'model__' to params if using a Pipeline
+        pipeline_params = {f'model__{k}': v for k, v in params.items()} if imbalance else params
 
-        print(f"Refitting the best pipeline ({best_model_name.upper()}) on the combined train and validation sets...")
-        # train on the entire training data (train + val) before making predictions on test data.
-        best_model.fit(
-            np.concatenate([X_train_processed, X_val_processed]),
-            np.concatenate([y_train_enc, y_val_enc])
-        )
-
-        print(f"\n{'='*50}")
-        print(f"Best model: {best_model_name.upper()} with CV Macro F1-Score: {model_scores[best_model_name]:.4f}")
-        print('='*50)
-
-    else:
-        model_scores = {}
-        best_pipelines = {}
+        print(f"\n{'='*50}\nTraining {model_name.upper()} with GridSearchCV...\n{'='*50}")
+        start = time.time()
         
-        for model_name in models:
-            
-            start = time.time()
-            print(f"\n{'='*50}")
-            print(f"Training {model_name.upper()}...")
-            print('='*50)
+        grid_search = GridSearchCV(
+            estimator=estimator_to_use, param_grid=pipeline_params,
+            cv=cv if cv else 5, scoring='f1_macro', n_jobs=-1, verbose=1
+        )
+        grid_search.fit(X_train, y_train)
 
-            base_model = model_dict[model_name]
+        best_score = grid_search.best_score_
+        model_scores[model_name] = best_score
+        best_estimators[model_name] = grid_search.best_estimator_
 
-            if imbalance:
-                resampler = get_resampler(imbalance)  # = SMOTE()
-                estimator_to_use = ImbPipeline([
-                    ('resampler', resampler),
-                    ('model', base_model)
-                ])
-            else:
-                estimator_to_use = base_model
+        print(f"Best params: {grid_search.best_params_}")
+        print(f"Time taken: {time.time() - start:.2f} seconds")
+        print(f"Best CV Macro F1-Score: {best_score:.4f}")
 
-            estimator_to_use.fit(X_train_processed, y_train_enc)
-            y_pred = estimator_to_use.predict(X_val_processed)
-            report = classification_report(y_val_enc, y_pred, output_dict=True, digits=3)
-            model_scores[model_name] = report['macro avg']['f1-score']
-            best_pipelines[model_name] = estimator_to_use
+    best_name = max(model_scores, key=model_scores.get)
+    return best_name, best_estimators[best_name], model_scores[best_name]
 
-            end = time.time()
-            
-            print(f"Time taken: {end - start:.2f} seconds")
-            print(f"\nClassification Report for {model_name.upper()}:")
-            print(classification_report(y_val_enc, y_pred, digits=3))
-            print(f"\nConfusion Matrix for {model_name.upper()}:")
-            cm = confusion_matrix(y_val_enc, y_pred)
-            print(cm)
-            # Show readable class names on axis ticks if LabelEncoder is available
-            # if le is not None and hasattr(le, 'classes_'):
-            #     try:
-            class_indices = np.arange(len(le.classes_))
-            class_names = le.inverse_transform(class_indices)
-            #     except Exception:
-            #         class_names = [str(i) for i in range(cm.shape[0])]
-            # else:
-            #     class_names = [str(i) for i in range(cm.shape[0])]
+def run_cv(
+        X_train, y_train,
+        models, model_dict,
+        cv, imbalance
+    ):
+    """Handles standard Cross Validation logic."""
+    model_scores, best_pipelines = {}, {}
 
-            sns.heatmap(
-                cm,
-                annot=True,
-                fmt="d",
-                cmap="Blues",
-                xticklabels=class_names,
-                yticklabels=class_names
-            )
-            plt.xlabel('Predicted')
-            plt.ylabel('True')
-            plt.title(f"Confusion Matrix for {model_name.upper()}")
-            plt.show()
-
-        best_model_name = max(model_scores, key=model_scores.get)
-        best_model = best_pipelines[best_model_name]
-
-        print(f"\n{'='*50}")
-        print(f"Best model: {best_model_name.upper()} with Validation Macro F1-Score: {model_scores[best_model_name]:.4f}")
-        print('='*50)
-
-        print(f"Refitting the best pipeline ({best_model_name.upper()}) on the combined train and validation sets...")
-        # train on the entire training data (train + val) before making predictions on test data.
-        best_model.fit(
-            np.concatenate([X_train_processed, X_val_processed]),
-            np.concatenate([y_train_enc, y_val_enc])
+    for model_name in models:
+        print(f"\n{'='*50}\nTraining {model_name.upper()} with CV...\n{'='*50}")
+        start = time.time()
+        
+        estimator_to_use = build_pipeline(model_dict[model_name], imbalance)
+        
+        cv_results = cross_validate(
+            estimator_to_use, X_train, y_train,
+            cv=cv, scoring=['f1_macro', 'f1_weighted'], n_jobs=-1
         )
 
+        mean_score = cv_results['test_f1_macro'].mean()
+        model_scores[model_name] = mean_score
+        best_pipelines[model_name] = estimator_to_use
 
-    return best_model 
+        print(f"Time taken: {time.time() - start:.2f} seconds")
+        print(f"Mean Macro F1-Score: {mean_score:.4f}")
+
+    best_name = max(model_scores, key=model_scores.get)
+    return best_name, best_pipelines[best_name], model_scores[best_name]
+
+def run_default(
+        X_train, y_train,
+        X_val, y_val,
+        models, model_dict,
+        imbalance, le
+    ):
+    """Handles standard Train/Val split training and plotting."""
+    model_scores, best_pipelines = {}, {}
+
+    for model_name in models:
+        print(f"\n{'='*50}\nTraining {model_name.upper()}...\n{'='*50}")
+        start = time.time()
+        
+        estimator_to_use = build_pipeline(model_dict[model_name], imbalance)
+        estimator_to_use.fit(X_train, y_train)
+        
+        y_pred = estimator_to_use.predict(X_val)
+        report = classification_report(y_val, y_pred, output_dict=True, digits=3)
+        
+        model_scores[model_name] = report['macro avg']['f1-score']
+        best_pipelines[model_name] = estimator_to_use
+
+        print(f"Time taken: {time.time() - start:.2f} seconds")
+        print(f"\nClassification Report for {model_name.upper()}:")
+        print(classification_report(y_val, y_pred, digits=3))
+
+        # Plotting logic
+        cm = confusion_matrix(y_val, y_pred)
+        class_names = le.inverse_transform(np.arange(len(le.classes_))) if le else None
+        
+        plt.figure(figsize=(6, 4))
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=class_names, yticklabels=class_names)
+        plt.xlabel('Predicted')
+        plt.ylabel('True')
+        plt.title(f"Confusion Matrix for {model_name.upper()}")
+        plt.show()
+
+    best_name = max(model_scores, key=model_scores.get)
+    return best_name, best_pipelines[best_name], model_scores[best_name]
+
+
+def train_and_evaluate_models(
+        X_train_processed, y_train_enc,
+        X_val_processed, y_val_enc,
+        models, cv=False, grid_config_file=None, imbalance=False, 
+        le=None, models_to_combine=None
+    ):
+    
+    # 1. Get dictionary with dynamic ensembles
+    model_dict = get_model_dict(models_to_combine)
+
+    # 2. Handle 'all' keyword
+    if models == ['all']:
+        exclude_models = ['gb', 'svc', 'lsvc', 'qda', 'dummy']
+        models = [m for m in model_dict.keys() if m not in exclude_models]
+        
+    # Optional: Automatically add the custom ensembles to the 'models' list to train them
+    if models_to_combine:
+        if 'custom_voting' not in models: models.append('custom_voting')
+        if 'custom_stacking' not in models: models.append('custom_stacking')
+
+    # 3. Route to the correct training loop
+    if grid_config_file:
+        best_name, best_model, best_score = run_grid_search(
+            X_train_processed, y_train_enc,
+            models, model_dict, grid_config_file, cv, imbalance
+        )
+    elif cv:
+        best_name, best_model, best_score = run_cv(
+            X_train_processed, y_train_enc,
+            models, model_dict, cv, imbalance
+        )
+    else:
+        best_name, best_model, best_score = run_default(
+            X_train_processed, y_train_enc,
+            X_val_processed, y_val_enc, models, model_dict, imbalance, le
+        )
+
+    # 4. Final output and Refit
+    print(f"\n{'='*50}")
+    print(f"Overall Best Model: {best_name.upper()} with Macro F1-Score: {best_score:.4f}")
+    print('='*50)
+    print("Refitting the best model on the combined train and validation sets...")
+    
+    best_model.fit(
+        np.concatenate([X_train_processed, X_val_processed]),
+        np.concatenate([y_train_enc, y_val_enc])
+    )
+
+    return best_model
+
     
 def combine_models(trained_models, model_scores, combination_method=None):
     """
@@ -618,7 +601,7 @@ def main():
     output_name = args.output
     cv=args.cv
     grid_config_file=args.grid_config_file
-    models_to_combined = args.models_to_combine
+    models_to_combine = args.models_to_combine
     imbalance = args.imbalance
 
     train, test, test_id = load_data(
@@ -639,22 +622,20 @@ def main():
             preprocessor
         ) = preprocess_data(train, target_variable, test_size)
 
-        # before:
-        # trained_models, model_scores = train_and_evaluate_models(
-        #     X_train_processed, y_train_enc, X_val_processed, y_val_enc, models, cv, grid_config_file
-        # )
+        best_model = train_and_evaluate_models(
+            X_train_processed=X_train_processed, 
+            y_train_enc=y_train_enc,
+            X_val_processed=X_val_processed, 
+            y_val_enc=y_val_enc, 
+            models=models,
+            cv=cv, 
+            grid_config_file=grid_config_file, 
+            imbalance=imbalance, 
+            le=le,
+            models_to_combine=models_to_combine  # Pass it right in!
+        )
 
-        # now for the cv and non cv cases, the best model is already selected in the train_and_evaluate_models function
-        if models_to_combined:
-            pass
-            # we should return the master combined model or directly the aggregated predictions and jump to saving the result
-        else:
-            best_model = train_and_evaluate_models(
-                X_train_processed, y_train_enc,
-                X_val_processed, y_val_enc, models,
-                cv, grid_config_file, imbalance, le
-            )
-            test_predictions = predict_test_data(test, preprocessor, best_model, le)
+        test_predictions = predict_test_data(test, preprocessor, best_model, le)
         
 
         # Save predictions to a file or return them
@@ -666,4 +647,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
