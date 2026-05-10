@@ -1,20 +1,9 @@
 #!/usr/bin/env python
 
 #TODO:
-####### finish the gemini edits on using pipeline for imbalance. did it on cv, and default, do it on grid part
-####### add to anki and to the report how the cm means taht the models does not confuse low and high
 # 0. Add CV, should edit the best model selection: for no cv and cv, do it inside the
 #     train_and_evaluate_models function and return the best model from there.
 #     So, the find_best_model function will be only for ensembling methods.
-# 1. Add grid serach with the config file, for now only return the best model based on the
-#     default hyperparameters.
-# 2. Combine predictors using ensemble methods:
-#     1. Soft voting, 2. Weighted soft voting, 3. Stacking, 4. Blending(?)
-#     Better to define a parameter to select only the best models for ensembling
-#     to not include the weak ones.
-# 3. Move the simple training with default models into a separate function
-# and call it from main.
-# 4. Activate SMOTE (and other sampling techniques) in the pipeline and compare results with and without it.
 # 5. Plot the results for each model and compare them visually.
 # 6. Add more evaluation metrics like ROC-AUC, Precision-Recall curves, etc.
 # 7. Add correlation matrix to EDA
@@ -167,7 +156,7 @@ def command_line_args():
     parser.add_argument(
         '--output',
         type=str,
-        default='../output/submission/submission.csv',
+        default='../output/submission.csv',
         help='Path to save the predictions'
     )
     return parser.parse_args()
@@ -181,9 +170,12 @@ def load_data(train_path, test_path, drop_columns=[]):
     test_id = test['id']
 
     for col in drop_columns:
-        print(f'Dropping column: {col}')
-        for data in [train, test]:
-            data.drop(columns=[col], inplace=True)
+        try:
+            print(f'Dropping column: {col}')
+            for data in [train, test]:
+                data.drop(columns=[col], inplace=True)
+        except:
+            print(f'Could not delete column: {col} in train or test')
 
     # train: col1, col2, ..., target
     # test: col1, col2, ...
@@ -293,7 +285,11 @@ def preprocess_data(train, target_variable, test_size):
     print(f"Processed training shape: {X_train_processed.shape}")
     print(f"Processed validation shape: {X_val_processed.shape}")
 
-    return X_train_processed, X_val_processed, y_train_enc, y_val_enc, le, preprocessor
+    return (
+        X_train_processed, X_val_processed,
+        y_train_enc, y_val_enc,
+        le, preprocessor
+    )
 
 
 def get_resampler(imbalance_type):
@@ -480,7 +476,7 @@ def run_default(
         plt.xlabel('Predicted')
         plt.ylabel('True')
         plt.title(f"Confusion Matrix for {model_name.upper()}")
-        plt.show()
+        # plt.show()
 
     best_name = max(model_scores, key=model_scores.get)
     return best_name, best_pipelines[best_name], model_scores[best_name]
@@ -574,11 +570,6 @@ def predict_test_data(test, preprocessor, model, le):
     test_processed = preprocessor.transform(test)
     print(f"Processed test shape: {test_processed.shape}")
 
-    ####
-    # first fit the model on the entire training data (train + val) before making predictions on test data.
-    ####
-    # model.fit(X_train_processed, y_train_enc)
-
     # Make predictions
     y_pred = model.predict(test_processed)
 
@@ -622,6 +613,7 @@ def main():
             preprocessor
         ) = preprocess_data(train, target_variable, test_size)
 
+### Using positional arguments up to the last 5?
         best_model = train_and_evaluate_models(
             X_train_processed=X_train_processed, 
             y_train_enc=y_train_enc,
