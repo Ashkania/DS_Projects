@@ -28,7 +28,7 @@ from sklearn.model_selection import cross_val_predict, train_test_split
 from sklearn.preprocessing import (
     LabelEncoder, OrdinalEncoder, StandardScaler, OneHotEncoder
 )
-from sklearn.base import clone
+from sklearn.base import clone, BaseEstimator, ClassifierMixin
 from sklearn.compose import ColumnTransformer
 from imblearn.over_sampling import SMOTE, RandomOverSampler
 from imblearn.under_sampling import RandomUnderSampler
@@ -57,7 +57,98 @@ from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
 from catboost import CatBoostClassifier
 
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+
 from sklearn.metrics import classification_report, confusion_matrix
+
+class TorchNNClassifier(BaseEstimator, ClassifierMixin):
+    """A minimal sklearn-compatible PyTorch classifier wrapper.
+
+    This trains a simple feed-forward network with one hidden layer and
+    exposes `fit`, `predict` and `predict_proba` so it can be used alongside
+    other sklearn estimators in the script.
+    """
+    def __init__(
+            self,
+            input_dim=None,
+            hidden_dim=64,
+            epochs=20,
+            batch_size=32,
+            lr=1e-3,
+            verbose=False,
+            device=None
+            ):
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.lr = lr
+        self.verbose = verbose
+        self._model = None
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+
+    def _build_model(self, input_dim, output_dim):
+        return nn.Sequential(
+            nn.Linear(input_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(self.hidden_dim, output_dim)
+        )
+
+    def fit(self, X, y):
+
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y, dtype=np.int64)
+
+        n_samples, n_features = X.shape
+        n_classes = int(np.max(y)) + 1
+
+        if self.input_dim is None:
+            self.input_dim = n_features
+
+        self._model = self._build_model(self.input_dim, n_classes).to(self.device)
+        dataset = TensorDataset(torch.from_numpy(X), torch.from_numpy(y))
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.Adam(self._model.parameters(), lr=self.lr)
+
+        self._model.train()
+        for epoch in range(self.epochs):
+            epoch_loss = 0.0
+            for xb, yb in loader:
+                xb = xb.to(self.device)
+                yb = yb.to(self.device)
+
+                optimizer.zero_grad()
+                out = self._model(xb)
+                loss = criterion(out, yb)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item() * xb.size(0)
+
+            if self.verbose:
+                print(f"Epoch {epoch+1}/{self.epochs}, Loss: {epoch_loss / n_samples:.4f}")
+
+        return self
+
+    def predict_proba(self, X):
+        if torch is None:
+            raise RuntimeError('PyTorch is not available. Install torch to use TorchNNClassifier')
+        X = np.asarray(X, dtype=np.float32)
+        self._model.eval()
+        with torch.no_grad():
+            xb = torch.from_numpy(X).to(self.device)
+            out = self._model(xb)
+            probs = torch.softmax(out, dim=1).cpu().numpy()
+        return probs
+
+    def predict(self, X):
+        probs = self.predict_proba(X)
+        return np.argmax(probs, axis=1)
+
 
 def command_line_args():
     parser = ArgumentParser(
@@ -114,8 +205,9 @@ def command_line_args():
         nargs='+',
         choices=[
             'dt', 'rf', 'lr', 'ridge', 'sgd', 'pa', 'perceptron',
-            'et', 'gb', 'hgb', 'xgb', 'lgbm', 'ada', 'svc', 'lsvc',
-            'knn', 'gnb', 'qda', 'lda', 'mlp', 'dummy', 'cat', 'rf_ovr', 'all'
+                'et', 'gb', 'hgb', 'xgb', 'lgbm', 'ada', 'svc', 'lsvc',
+                'knn', 'gnb', 'qda', 'lda', 'mlp', 'dummy', 'cat',
+                'rf_ovr', 'torch', 'all'
             ],
         help='Models to train: dt (Decision Tree), rf (Random Forest),' \
         'lr (Logistic Regression), ridge (Ridge), sgd (SGD),' \
@@ -150,7 +242,7 @@ def command_line_args():
         choices=[
             'dt', 'rf', 'lr', 'ridge', 'sgd', 'pa', 'perceptron',
             'et', 'gb', 'hgb', 'xgb', 'lgbm', 'ada', 'svc', 'lsvc',
-            'knn', 'gnb', 'qda', 'lda', 'mlp', 'dummy', 'cat', 'all'
+            'knn', 'gnb', 'qda', 'lda', 'mlp', 'dummy', 'cat', 'torch', 'all'
             ]
     )
     parser.add_argument(
@@ -334,6 +426,8 @@ def get_model_dict(models_to_combine=None):
         # Specialized Models
         'dummy': DummyClassifier(strategy='most_frequent'), # Precision ill defined set to 0
         'cat' : CatBoostClassifier(random_state=42, verbose=0),
+        # Simple PyTorch model (sklearn-compatible wrapper)
+        'torch': TorchNNClassifier(),
         # One vs Rest
         'rf_ovr': OneVsRestClassifier(
             RandomForestClassifier(random_state=42, n_jobs=-1, class_weight='balanced')
