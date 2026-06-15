@@ -64,7 +64,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.decomposition import PCA
 
-class TorchNNClassifier(BaseEstimator, ClassifierMixin):
+class ANNClassifier(BaseEstimator, ClassifierMixin):
     """A minimal sklearn-compatible PyTorch classifier wrapper.
 
     This trains a simple feed-forward network with one hidden layer and
@@ -75,10 +75,11 @@ class TorchNNClassifier(BaseEstimator, ClassifierMixin):
             self,
             input_dim=None,
             hidden_dim=64,
-            epochs=20,
+            epochs=200,
             batch_size=32,
             lr=1e-3,
             verbose=False,
+            plot_training_history=True,
             device=None
             ):
         self.input_dim = input_dim
@@ -87,8 +88,11 @@ class TorchNNClassifier(BaseEstimator, ClassifierMixin):
         self.batch_size = batch_size
         self.lr = lr
         self.verbose = verbose
+        self.plot_training_history = plot_training_history
         self._model = None
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.loss_history_ = []
+        self.accuracy_history_ = []
 
     def _build_model(self, input_dim, output_dim):
         return nn.Sequential(
@@ -97,6 +101,29 @@ class TorchNNClassifier(BaseEstimator, ClassifierMixin):
             nn.Dropout(0.2),
             nn.Linear(self.hidden_dim, output_dim)
         )
+
+    def _plot_training_history(self):
+        if not self.loss_history_ or not self.accuracy_history_:
+            return
+
+        epochs = np.arange(1, len(self.loss_history_) + 1)
+        _, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+        axes[0].plot(epochs, self.loss_history_, marker='o')
+        axes[0].set_title('ANN Training Loss')
+        axes[0].set_xlabel('Epoch')
+        axes[0].set_ylabel('Loss')
+        axes[0].grid(True, alpha=0.3)
+
+        axes[1].plot(epochs, self.accuracy_history_, marker='o', color='tab:green')
+        axes[1].set_title('ANN Training Accuracy')
+        axes[1].set_xlabel('Epoch')
+        axes[1].set_ylabel('Accuracy')
+        axes[1].set_ylim(0.8, 1)
+        axes[1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
 
     def fit(self, X, y):
 
@@ -115,10 +142,13 @@ class TorchNNClassifier(BaseEstimator, ClassifierMixin):
 
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(self._model.parameters(), lr=self.lr)
+        self.loss_history_ = []
+        self.accuracy_history_ = []
 
         self._model.train()
         for epoch in range(self.epochs):
             epoch_loss = 0.0
+            epoch_correct = 0
             for xb, yb in loader:
                 xb = xb.to(self.device)
                 yb = yb.to(self.device)
@@ -129,15 +159,27 @@ class TorchNNClassifier(BaseEstimator, ClassifierMixin):
                 loss.backward()
                 optimizer.step()
                 epoch_loss += loss.item() * xb.size(0)
+                epoch_correct += (out.argmax(dim=1) == yb).sum().item()
+
+            epoch_loss /= n_samples
+            epoch_accuracy = epoch_correct / n_samples
+            self.loss_history_.append(epoch_loss)
+            self.accuracy_history_.append(epoch_accuracy)
 
             if self.verbose:
-                print(f"Epoch {epoch+1}/{self.epochs}, Loss: {epoch_loss / n_samples:.4f}")
+                print(
+                    f"Epoch {epoch+1}/{self.epochs}, "
+                    f"Loss: {epoch_loss:.4f}, Accuracy: {epoch_accuracy:.4f}"
+                )
+
+        if self.plot_training_history:
+            self._plot_training_history()
 
         return self
 
     def predict_proba(self, X):
         if torch is None:
-            raise RuntimeError('PyTorch is not available. Install torch to use TorchNNClassifier')
+            raise RuntimeError('PyTorch is not available. Install torch to use ANNClassifier')
         X = np.asarray(X, dtype=np.float32)
         self._model.eval()
         with torch.no_grad():
@@ -213,7 +255,7 @@ def command_line_args():
             'dt', 'rf', 'lr', 'ridge', 'sgd', 'pa', 'perceptron',
                 'et', 'gb', 'hgb', 'xgb', 'lgbm', 'ada', 'svc', 'lsvc',
                 'knn', 'gnb', 'qda', 'lda', 'mlp', 'dummy', 'cat',
-                'rf_ovr', 'torch', 'all'
+                'rf_ovr', 'ann', 'all'
             ],
         help='Models to train: dt (Decision Tree), rf (Random Forest),' \
         'lr (Logistic Regression), ridge (Ridge), sgd (SGD),' \
@@ -248,7 +290,7 @@ def command_line_args():
         choices=[
             'dt', 'rf', 'lr', 'ridge', 'sgd', 'pa', 'perceptron',
             'et', 'gb', 'hgb', 'xgb', 'lgbm', 'ada', 'svc', 'lsvc',
-            'knn', 'gnb', 'qda', 'lda', 'mlp', 'dummy', 'cat', 'torch', 'all'
+            'knn', 'gnb', 'qda', 'lda', 'mlp', 'dummy', 'cat', 'ann', 'all'
             ]
     )
     parser.add_argument(
@@ -274,10 +316,45 @@ def load_data(train_path, test_path, drop_columns=[]):
         except:
             print(f'Could not delete column: {col} in train or test')
 
+    train, test = create_new_features(train, test)
+
     # train: col1, col2, ..., target
     # test: col1, col2, ...
     # test_id: col_id
     return train, test, test_id
+
+def create_new_features(train, test):
+
+    for data in [train, test]:
+
+        # Create astronomical colors
+        data['u_g'] = data['u'] - data['g']
+        data['g_r'] = data['g'] - data['r']
+        data['r_i'] = data['r'] - data['i']
+        data['i_z'] = data['i'] - data['z']
+
+        # Non adjacent magnitude differences
+        data['u_r'] = data['u'] - data['r']
+        data['u_i'] = data['u'] - data['i']
+        data['u_z'] = data['u'] - data['z']
+
+        data['g_i'] = data['g'] - data['i']
+        data['g_z'] = data['g'] - data['z']
+
+        data['r_z'] = data['r'] - data['z']
+
+        # measure changes in slopes
+        data['slope_ug'] = data['u_g'] - data['g_r']
+        data['slope_gr'] = data['g_r'] - data['r_i']
+        data['slope_ri'] = data['r_i'] - data['i_z']
+
+        # sky position features
+        # data['ra_sin'] = np.sin(np.radians(data['ra']))
+        # data['ra_cos'] = np.cos(np.radians(data['ra']))
+        # data['dec_sin'] = np.sin(np.radians(data['dec']))
+        # data['dec_cos'] = np.cos(np.radians(data['dec']))
+
+    return train, test
 
 def eda(train_data, target_variable):
 
@@ -486,7 +563,7 @@ def get_model_dict(models_to_combine=None):
         'dummy': DummyClassifier(strategy='most_frequent'), # Precision ill defined set to 0
         'cat' : CatBoostClassifier(random_state=42, verbose=0),
         # Simple PyTorch model (sklearn-compatible wrapper)
-        'torch': TorchNNClassifier(),
+        'ann': ANNClassifier(),
         # One vs Rest
         'rf_ovr': OneVsRestClassifier(
             RandomForestClassifier(random_state=42, n_jobs=-1, class_weight='balanced')
