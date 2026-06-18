@@ -284,14 +284,8 @@ def command_line_args():
         'configurations for hyperparameter tuning'
     )
     parser.add_argument(
-        '--models-to-combine',
-        nargs='+',
-        default=None,
-        choices=[
-            'dt', 'rf', 'lr', 'ridge', 'sgd', 'pa', 'perceptron',
-            'et', 'gb', 'hgb', 'xgb', 'lgbm', 'ada', 'svc', 'lsvc',
-            'knn', 'gnb', 'qda', 'lda', 'mlp', 'dummy', 'cat', 'ann', 'all'
-            ]
+        '--combine-models-method',
+        choices=['voting', 'stacking'],
     )
     parser.add_argument(
         '--output',
@@ -529,8 +523,8 @@ def get_resampler(imbalance_type):
     return None
 
 
-def get_model_dict(models_to_combine=None):
-    """Stores base models and dynamically creates ensembles if requested."""
+def get_model_dict():
+    """Stores base models."""
     model_dict = {
         # Linear Models
         'lr': LogisticRegression(random_state=42, max_iter=1000, class_weight='balanced'),
@@ -570,26 +564,73 @@ def get_model_dict(models_to_combine=None):
         ),
     }
 
-    # Dynamically build ensembles if the user provided a list of models
-    if models_to_combine:
-        # Create the [('name', model_obj)] list required by Sklearn
-        # We use clone() so the ensemble gets fresh instances, not shared memory
-        estimators = [
-            (name, clone(model_dict[name])) 
-            for name in models_to_combine if name in model_dict
-        ]
-        
-        if estimators:
-            model_dict['custom_voting'] = VotingClassifier(
-                estimators=estimators, voting='soft', n_jobs=-1  # if error for models without a probability: have to use hard voting
-            )
-            model_dict['custom_stacking'] = StackingClassifier(
-                estimators=estimators,
-                final_estimator=LogisticRegression(class_weight='balanced'),
-                n_jobs=-1
-            )
-            
     return model_dict
+
+
+def expand_model_list(models, model_dict):
+    """Expand model aliases and validate model names."""
+    if not models:
+        raise ValueError('Use --models to choose which models should be trained.')
+
+    if 'all' in models:
+        exclude_models = ['gb', 'svc', 'lsvc', 'qda', 'dummy']
+        return [
+            name for name in model_dict
+            if name not in exclude_models
+        ]
+
+    invalid_models = [model_name for model_name in models if model_name not in model_dict]
+    if invalid_models:
+        raise ValueError(f"Unknown model(s): {', '.join(invalid_models)}")
+
+    return list(dict.fromkeys(models))
+
+
+def add_combined_model(model_dict, models, combine_models_method):
+    """Add a combined model built from the models passed to --models."""
+    if not combine_models_method:
+        return models
+
+    if len(models) < 2:
+        raise ValueError('--combine-models-method requires at least two models in --models.')
+
+    estimators = [
+        (model_name, clone(model_dict[model_name]))
+        for model_name in models
+    ]
+
+    if combine_models_method == 'voting':
+        models_without_proba = [
+            model_name for model_name, estimator in estimators
+            if not callable(getattr(estimator, 'predict_proba', None))
+        ]
+        voting_method = 'soft'
+        print("Trying soft voting for the combined model...")
+
+        if models_without_proba:
+            voting_method = 'hard'
+            print(
+                'Soft voting is not possible because these models do not '
+                f"support predict_proba: {', '.join(models_without_proba)}"
+            )
+            print("Falling back to hard voting.")
+
+        model_dict['combined_voting'] = VotingClassifier(
+            estimators=estimators,
+            voting=voting_method,
+            n_jobs=-1
+        )
+        return ['combined_voting']
+
+    if combine_models_method == 'stacking':
+        model_dict['combined_stacking'] = StackingClassifier(
+            estimators=estimators,
+            final_estimator=LogisticRegression(class_weight='balanced'),
+            n_jobs=-1
+        )
+        return ['combined_stacking']
+
+    raise ValueError(f"Unsupported combine models method: {combine_models_method}")
 
 
 def build_pipeline(model, imbalance_type=False):
@@ -627,7 +668,7 @@ def run_grid_search(
         
         grid_search = GridSearchCV(
             estimator=estimator_to_use, param_grid=pipeline_params,
-            cv=cv if cv else 5, scoring='f1_macro', n_jobs=-1, verbose=1
+            cv=cv if cv else 5, scoring='f1_macro', n_jobs=1, verbose=2
         )
         grid_search.fit(X_train, y_train)
 
@@ -716,21 +757,12 @@ def train_and_evaluate_models(
         X_train_processed, y_train_enc,
         X_val_processed, y_val_enc,
         models, cv=False, grid_config_file=None, imbalance=False, 
-        le=None, models_to_combine=None
+        le=None, combine_models_method=None
     ):
     
-    # 1. Get dictionary with dynamic ensembles
-    model_dict = get_model_dict(models_to_combine)
-
-    # 2. Handle 'all' keyword
-    if models == ['all']:
-        exclude_models = ['gb', 'svc', 'lsvc', 'qda', 'dummy']
-        models = [m for m in model_dict.keys() if m not in exclude_models]
-        
-    # Optional: Automatically add the custom ensembles to the 'models' list to train them
-    if models_to_combine:
-        if 'custom_voting' not in models: models.append('custom_voting')
-        if 'custom_stacking' not in models: models.append('custom_stacking')
+    model_dict = get_model_dict()
+    models = expand_model_list(models, model_dict)
+    models = add_combined_model(model_dict, models, combine_models_method)
 
     # 3. Route to the correct training loop
     if grid_config_file:
@@ -762,39 +794,6 @@ def train_and_evaluate_models(
 
     return best_model
 
-    
-def combine_models(trained_models, model_scores, combination_method=None):
-    """
-    Find the best model based on the provided model scores and combination method.
-    This is meant to be only for the grid search case, for the cv and non cv cases,
-    the best model is already selected in the train_and_evaluate_models function
-    and returned from there.
-    """
-    # model_scores = {'model_name': weighted_avg_f1_score, ...}
-    if combination_method == 'soft_voting':
-        # Implement soft voting logic here (e.g., average probabilities)
-        # return voting_model
-        pass
-    elif combination_method == 'weighted_soft_voting':
-        # Implement weighted soft voting logic here (e.g., weighted average of probabilities)
-        # return weighted_voting_model
-        pass
-    elif combination_method == 'stacking':
-        # Implement stacking logic here (e.g., train a meta-model on the predictions of base models)
-        # return stacked_model
-        pass
-    elif combination_method == 'blending':
-        # Implement blending logic here (e.g., train a meta-model on a holdout set)
-        # return blended_model
-        pass
-    # else:
-    #     best_model_name = max(model_scores, key=model_scores.get)
-    #     print(f"\n{'='*50}")
-    #     print(f"Best model: {best_model_name.upper()} with: {model_scores[best_model_name]:.4f}")
-    #     print('='*50)
-    #     best_model = trained_models[best_model_name]
-    #     return best_model
-
 def predict_test_data(test, preprocessor, model, le):
     # Apply the same preprocessing to test data
     test_processed = preprocessor.transform(test)
@@ -822,7 +821,7 @@ def main():
     output_name = args.output
     cv=args.cv
     grid_config_file=args.grid_config_file
-    models_to_combine = args.models_to_combine
+    combine_models_method = args.combine_models_method
     imbalance = args.imbalance
 
     train, test, test_id = load_data(
@@ -833,7 +832,7 @@ def main():
     if args.eda:
         eda(train, target_variable)
 
-    if models:
+    if models or args.pca:
         (
             X_train_processed,
             X_val_processed,
@@ -843,31 +842,30 @@ def main():
             preprocessor
         ) = preprocess_data(train, target_variable, test_size)
 
-        # Visualize PCA 2D projection if requested
         if args.pca:
             pca_2d_visualization(X_train_processed, y_train_enc, le=le, title="PCA 2D Visualization - Class Distribution")
+        else:
+        ### Using positional arguments up to the last 5?
+            best_model = train_and_evaluate_models(
+                X_train_processed=X_train_processed, 
+                y_train_enc=y_train_enc,
+                X_val_processed=X_val_processed, 
+                y_val_enc=y_val_enc, 
+                models=models,
+                cv=cv, 
+                grid_config_file=grid_config_file, 
+                imbalance=imbalance, 
+                le=le,
+                combine_models_method=combine_models_method
+            )
 
-### Using positional arguments up to the last 5?
-        best_model = train_and_evaluate_models(
-            X_train_processed=X_train_processed, 
-            y_train_enc=y_train_enc,
-            X_val_processed=X_val_processed, 
-            y_val_enc=y_val_enc, 
-            models=models,
-            cv=cv, 
-            grid_config_file=grid_config_file, 
-            imbalance=imbalance, 
-            le=le,
-            models_to_combine=models_to_combine  # Pass it right in!
-        )
+            test_predictions = predict_test_data(test, preprocessor, best_model, le)
+            
 
-        test_predictions = predict_test_data(test, preprocessor, best_model, le)
-        
-
-        # Save predictions to a file or return them
-        output = pd.DataFrame({'id': test_id, 'Irrigation_Need': test_predictions})
-        output.to_csv(output_name, index=False)
-        print(f"Predictions saved to {output_name}")
+            # Save predictions to a file or return them
+            output = pd.DataFrame({'id': test_id, 'Irrigation_Need': test_predictions})
+            output.to_csv(output_name, index=False)
+            print(f"Predictions saved to {output_name}")
 
     print('Done!')
 
