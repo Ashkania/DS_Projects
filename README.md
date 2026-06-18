@@ -1,3 +1,12 @@
+### Kaggle Projects
+
+## Project 1: Predicting Irrigation Need (Classification)
+
+## Project 2: Predicting Stellar Class (Classification)
+
+
+### Mini Projects
+
 ## Project 0: EDA
 Our plan is to use a supervised learning technique to predict which customers are most likely to cancel their subscription using:
 
