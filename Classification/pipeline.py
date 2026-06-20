@@ -31,7 +31,7 @@ from argparse import ArgumentParser, RawDescriptionHelpFormatter
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import (
-    LabelEncoder, StandardScaler, OneHotEncoder
+    LabelEncoder, StandardScaler, OneHotEncoder, OrdinalEncoder
 )
 from sklearn.base import clone, BaseEstimator, ClassifierMixin
 from sklearn.compose import ColumnTransformer
@@ -81,8 +81,8 @@ def command_line_args():
             applies optional project-specific feature engineering,
             and trains/evaluates one or more classification models.
             Usage:
-            ./pipeline.py --train-dataset ../data/train.csv
-            --test-dataset ../data/test.csv [--drop-columns id]
+            ./pipeline.py --train-dataset ../data/stellar/train.csv
+            --test-dataset ../data/stellar/test.csv [--drop-columns id]
             [--feature-module stellar] [--eda]
             [--models all] [--cv 5] [--imbalance smote]
             [--grid-config-file ../data/grid_config.cfg]
@@ -329,12 +329,13 @@ def load_data(train_path, test_path, drop_columns=[], feature_module=None):
         except:
             print(f'Could not delete column: {col} in train or test')
 
+    feature_engineer = None
     if feature_module:
         feature_engineer = load_feature_engineer(feature_module)
         print(f"Applying feature engineering module: {feature_module}")
         train, test = feature_engineer.transform(train, test)
 
-    return train, test, test_id
+    return train, test, test_id, feature_engineer
 
 def eda(train_data, target_variable):
 
@@ -813,7 +814,7 @@ def main():
     combine_models_method = args.combine_models_method
     imbalance = args.imbalance
 
-    train, test, test_id = load_data(
+    train, test, test_id, feature_engineer = load_data(
         train_path, test_path, drop_columns, feature_module
     )
     target_variable = args.target_variable or train.columns[-1]
@@ -829,12 +830,11 @@ def main():
             y_val_enc,
             le,
             preprocessor
-        ) = preprocess_data(train, target_variable, test_size)
+        ) = preprocess_data(train, target_variable, test_size, feature_engineer)
 
         if args.pca:
             pca_2d_visualization(X_train_processed, y_train_enc, le=le, title="PCA 2D Visualization - Class Distribution")
         else:
-        ### Using positional arguments up to the last 5?
             best_model = train_and_evaluate_models(
                 X_train_processed=X_train_processed, 
                 y_train_enc=y_train_enc,
