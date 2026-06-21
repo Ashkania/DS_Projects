@@ -91,16 +91,10 @@ def command_line_args():
             """
         )
     parser.add_argument(
-        '--train-dataset',
+        '--project-name',
         type=str,
-        required=True,
-        help='Path to the training dataset'
-    )
-    parser.add_argument(
-        '--test-dataset',
-        type=str,
-        required=True,
-        help='Path to the test dataset'
+        choices=['stellar', 'irrigation'],
+        help='Name of the project (used for organizing inputs, outputs and models)'
     )
     parser.add_argument(
         '--drop-columns',
@@ -109,12 +103,11 @@ def command_line_args():
         help='List of columns to drop from the dataset'
     )
     parser.add_argument(
-        '--feature-module',
-        type=str,
-        default=None,
-        help='Name of a project-specific feature engineering module '
-             'in feature_engineering/ (e.g. "stellar"). Omit to run '
-             'on raw columns with no custom feature engineering.'
+        '--feature-engineering',
+        action='store_true',
+        help='pass to apply feature engineering module located'
+             'in feature_engineering/. Omit to run on raw columns'
+             'with no custom feature engineering.'
     )
     parser.add_argument(
         '--target-variable',
@@ -313,9 +306,9 @@ class ANNClassifier(BaseEstimator, ClassifierMixin):
         probs = self.predict_proba(X)
         return np.argmax(probs, axis=1)
 
-def load_data(train_path, test_path, drop_columns=[]):
-    train = pd.read_csv(train_path)
-    test = pd.read_csv(test_path)
+def load_data(project_name, drop_columns=[]):
+    train = pd.read_csv(f'data/{project_name}/train.csv')
+    test = pd.read_csv(f'data/{project_name}/test.csv')
 
     if 'id' in test.columns:
         test_id = test['id']
@@ -333,7 +326,7 @@ def load_data(train_path, test_path, drop_columns=[]):
 
     return train, test, test_id
 
-def apply_feature_engineering(train, test, feature_module):
+def apply_feature_engineering(project_name, train, test, feature_engineering=False):
     """Applies the project-specific feature engineering module, if any.
 
     Kept separate from load_data so callers can run EDA on raw columns
@@ -342,11 +335,11 @@ def apply_feature_engineering(train, test, feature_module):
     project-specific encoding config (ordinal/binary column mappings).
     """
 
-    if not feature_module:
+    if not feature_engineering:
         return train, test, None
 
-    feature_engineer = load_feature_engineer(feature_module)
-    print(f"Applying feature engineering module: {feature_module}")
+    feature_engineer = load_feature_engineer(project_name)
+    print(f"Applying feature engineering module: {project_name}")
     train, test = feature_engineer.transform(train, test)
     return train, test, feature_engineer
 
@@ -498,12 +491,6 @@ def preprocess_data(train, target_variable, test_size, feature_engineer=None):
     # Create preprocessor with ColumnTransformer
     preprocessor = ColumnTransformer(
         transformers=transformers,
-        # [
-        #     # ('ordinal', OrdinalEncoder(categories=ordinal_mappings), ordinal_cols),
-        #     # ('binary', OrdinalEncoder(categories=[Mulching_Used_mapping]), binary_cols),
-        #     ('onehot', OneHotEncoder(sparse_output=False, handle_unknown='ignore'), onehot_cols),
-        #     ('num', StandardScaler(), num_cols)
-        # ],
         remainder='passthrough'
     )
 
@@ -820,11 +807,11 @@ def predict_test_data(test, preprocessor, model, le):
 
 def main():
     args = command_line_args()
-    train_path = args.train_dataset
-    test_path = args.test_dataset
-    test_size = args.test_size
+
+    project_name = args.project_name
     drop_columns = args.drop_columns
-    feature_module = args.feature_module
+
+    test_size = args.test_size
     models = args.models
     output_name = args.output
     cv=args.cv
@@ -833,14 +820,16 @@ def main():
     imbalance = args.imbalance
 
     train, test, test_id = load_data(
-        train_path, test_path, drop_columns
+        project_name, drop_columns
     )
     target_variable = args.target_variable or train.columns[-1]
 
     if args.eda:
         eda(train, target_variable)
 
-    train, test, feature_engineer = apply_feature_engineering(train, test, feature_module)
+    train, test, feature_engineer = apply_feature_engineering(
+        project_name, train, test, args.feature_engineering
+        )
 
     if models or args.pca:
         (
@@ -868,11 +857,15 @@ def main():
                 combine_models_method=combine_models_method
             )
 
-            model_dir = 'artifacts'
+            model_dir = f'artifacts/{project_name}'
+            os.makedirs(model_dir, exist_ok=True)
             joblib.dump(best_model, os.path.join(model_dir, 'model.joblib'))
             joblib.dump(preprocessor, os.path.join(model_dir, 'preprocessor.joblib'))
             joblib.dump(le, os.path.join(model_dir, 'label_encoder.joblib'))
-            joblib.dump(feature_module, os.path.join(model_dir, 'feature_module.joblib'))
+            joblib.dump(
+                project_name if args.feature_engineering else None,
+                os.path.join(model_dir, 'feature_module.joblib')
+                )
 
             test_predictions = predict_test_data(test, preprocessor, best_model, le)
             
