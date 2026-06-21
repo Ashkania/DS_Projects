@@ -26,6 +26,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import time
 import json
+import joblib
+import os
 
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 
@@ -866,9 +868,14 @@ def main():
                 combine_models_method=combine_models_method
             )
 
+            model_dir = 'artifacts'
+            joblib.dump(best_model, os.path.join(model_dir, 'model.joblib'))
+            joblib.dump(preprocessor, os.path.join(model_dir, 'preprocessor.joblib'))
+            joblib.dump(le, os.path.join(model_dir, 'label_encoder.joblib'))
+            joblib.dump(feature_module, os.path.join(model_dir, 'feature_module.joblib'))
+
             test_predictions = predict_test_data(test, preprocessor, best_model, le)
             
-
             # Save predictions to a file or return them
             output = pd.DataFrame({'id': test_id, target_variable: test_predictions})
             output.to_csv(output_name, index=False)
