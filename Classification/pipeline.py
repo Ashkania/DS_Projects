@@ -178,7 +178,7 @@ def command_line_args():
     parser.add_argument(
         '--output',
         type=str,
-        default='../output/submission.csv',
+        default='output/result.csv',
         help='Path to save the predictions'
     )
     return parser.parse_args()
@@ -311,7 +311,7 @@ class ANNClassifier(BaseEstimator, ClassifierMixin):
         probs = self.predict_proba(X)
         return np.argmax(probs, axis=1)
 
-def load_data(train_path, test_path, drop_columns=[], feature_module=None):
+def load_data(train_path, test_path, drop_columns=[]):
     train = pd.read_csv(train_path)
     test = pd.read_csv(test_path)
 
@@ -329,13 +329,25 @@ def load_data(train_path, test_path, drop_columns=[], feature_module=None):
         except:
             print(f'Could not delete column: {col} in train or test')
 
-    feature_engineer = None
-    if feature_module:
-        feature_engineer = load_feature_engineer(feature_module)
-        print(f"Applying feature engineering module: {feature_module}")
-        train, test = feature_engineer.transform(train, test)
+    return train, test, test_id
 
-    return train, test, test_id, feature_engineer
+def apply_feature_engineering(train, test, feature_module):
+    """Applies the project-specific feature engineering module, if any.
+
+    Kept separate from load_data so callers can run EDA on raw columns
+    before any derived features are added. Returns the feature_engineer
+    instance too (or None), since preprocess_data may need it for
+    project-specific encoding config (ordinal/binary column mappings).
+    """
+
+    if not feature_module:
+        return train, test, None
+
+    feature_engineer = load_feature_engineer(feature_module)
+    print(f"Applying feature engineering module: {feature_module}")
+    train, test = feature_engineer.transform(train, test)
+    return train, test, feature_engineer
+
 
 def eda(train_data, target_variable):
 
@@ -367,12 +379,16 @@ def eda(train_data, target_variable):
     plt.title(f"Distribution of Labels")
 
     # Figure2:
+    n_cols_plot = 2
+    n_rows_plot = int(np.ceil(len(num_cols) / n_cols_plot))
     print('\nBox Plots for Numerical Features:')
-    _, axes1 = plt.subplots(4, 2, figsize=(14, 10))  # Reduce height to make boxes smaller
-    axes1 = axes1.flatten()
+    _, axes1 = plt.subplots(n_rows_plot, n_cols_plot, figsize=(14, 2.5*n_rows_plot))
+    axes1 = np.atleast_1d(axes1).flatten()
     for i, col in enumerate(num_cols):
         sns.boxplot(train_data[col], ax=axes1[i], orient='h')
         axes1[i].set_title(f"Distribution of {col}")
+    for j in range(len(num_cols), len(axes1)):
+        axes1[j].axis('off')
     plt.subplots_adjust(hspace=0.4, wspace=0.3)
     plt.tight_layout()
 
@@ -814,13 +830,15 @@ def main():
     combine_models_method = args.combine_models_method
     imbalance = args.imbalance
 
-    train, test, test_id, feature_engineer = load_data(
-        train_path, test_path, drop_columns, feature_module
+    train, test, test_id = load_data(
+        train_path, test_path, drop_columns
     )
     target_variable = args.target_variable or train.columns[-1]
 
     if args.eda:
         eda(train, target_variable)
+
+    train, test, feature_engineer = apply_feature_engineering(train, test, feature_module)
 
     if models or args.pca:
         (
